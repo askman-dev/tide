@@ -8,6 +8,7 @@ pub fn tab_bar<T: IntoView + 'static, A: IntoView + 'static>(
     actions: A,
     theme: UiTheme,
 ) -> impl IntoView {
+    let left_padding = if cfg!(target_os = "macos") { 72.0 } else { 8.0 };
     let tabs = tabs.into_view().style(|s| s.flex_row().col_gap(6.0));
     h_stack((
         tabs,
@@ -18,7 +19,8 @@ pub fn tab_bar<T: IntoView + 'static, A: IntoView + 'static>(
         s.width_full()
             .height(32.0)
             .items_center()
-            .padding_horiz(8.0)
+            .padding_left(left_padding)
+            .padding_right(8.0)
             .background(theme.surface)
             .border_bottom(1.0)
             .border_color(theme.border_subtle)
