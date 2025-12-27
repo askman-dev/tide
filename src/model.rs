@@ -12,6 +12,7 @@ pub struct WorkspaceTab {
 #[derive(Clone)]
 pub struct TreeEntry {
     pub id: String,
+    pub path: PathBuf,
     pub name: String,
     pub depth: usize,
     pub is_dir: bool,

@@ -1,6 +1,7 @@
 use crate::components::atoms::{icon, list_item, list_label, panel_header};
 use crate::components::icons::{CHEVRON_DOWN, CHEVRON_RIGHT, FILE, FOLDER, GIT};
 use crate::model::TreeEntry;
+use crate::services::list_dir_entries;
 use crate::theme::{TREE_INDENT, UiTheme};
 use floem::prelude::*;
 
@@ -16,6 +17,7 @@ pub fn panel_view<V: IntoView + 'static>(
         Container::new(body).style(move |s| {
             s.width_full()
                 .height_full()
+                .items_stretch()
                 .background(theme.panel_bg)
         }),
     ))
@@ -23,12 +25,18 @@ pub fn panel_view<V: IntoView + 'static>(
 }
 
 pub fn file_tree_view(entries: Vec<TreeEntry>, theme: UiTheme) -> impl IntoView {
+    let entries = RwSignal::new(entries);
     dyn_stack(
-        move || entries.clone(),
+        move || entries.get(),
         |entry| entry.id.clone(),
         move |entry| {
             let indent = TREE_INDENT * entry.depth as f32;
             let is_dir = entry.is_dir;
+            let is_expanded = entry.expanded;
+            let entry_id = entry.id.clone();
+            let entry_path = entry.path.clone();
+            let entry_depth = entry.depth;
+            let entries_signal = entries;
             let chevron = if is_dir {
                 if entry.expanded {
                     CHEVRON_DOWN
@@ -50,10 +58,24 @@ pub fn file_tree_view(entries: Vec<TreeEntry>, theme: UiTheme) -> impl IntoView 
             ))
             .style(|s| s.items_center().col_gap(6.0));
 
-            list_item(row, indent, theme)
+            let row = list_item(row, indent, theme);
+            if is_dir {
+                row.on_click_stop(move |_| {
+                    toggle_dir(
+                        entries_signal,
+                        entry_id.clone(),
+                        entry_path.clone(),
+                        entry_depth,
+                        is_expanded,
+                    );
+                })
+                .into_any()
+            } else {
+                row.into_any()
+            }
         },
     )
-    .style(|s| s.flex_col())
+    .style(|s| s.flex_col().width_full())
 }
 
 pub fn git_status_view(entries: Vec<String>, theme: UiTheme) -> impl IntoView {
@@ -70,5 +92,37 @@ pub fn git_status_view(entries: Vec<String>, theme: UiTheme) -> impl IntoView {
             list_item(row, TREE_INDENT, theme)
         },
     )
-    .style(|s| s.flex_col())
+    .style(|s| s.flex_col().width_full())
+}
+
+fn toggle_dir(
+    entries: RwSignal<Vec<TreeEntry>>,
+    entry_id: String,
+    entry_path: std::path::PathBuf,
+    entry_depth: usize,
+    is_expanded: bool,
+) {
+    entries.update(|entries| {
+        let Some(index) = entries.iter().position(|entry| entry.id == entry_id) else {
+            return;
+        };
+        if is_expanded {
+            entries[index].expanded = false;
+            let mut remove_count = 0;
+            for entry in entries.iter().skip(index + 1) {
+                if entry.depth > entry_depth {
+                    remove_count += 1;
+                } else {
+                    break;
+                }
+            }
+            if remove_count > 0 {
+                entries.drain(index + 1..index + 1 + remove_count);
+            }
+        } else {
+            entries[index].expanded = true;
+            let children = list_dir_entries(&entry_path, entry_depth + 1);
+            entries.splice(index + 1..index + 1, children);
+        }
+    });
 }

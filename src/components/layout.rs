@@ -15,7 +15,8 @@ pub fn tab_bar<T: IntoView + 'static, A: IntoView + 'static>(
         actions.into_view(),
     ))
     .style(move |s| {
-        s.height(32.0)
+        s.width_full()
+            .height(32.0)
             .items_center()
             .padding_horiz(8.0)
             .background(theme.surface)
@@ -39,21 +40,28 @@ pub fn main_layout<L: IntoView + 'static, C: IntoView + 'static, R: IntoView + '
     center: C,
     right: R,
     theme: UiTheme,
+    show_center: bool,
 ) -> impl IntoView {
-    h_stack((
-        main_work(left, theme),
-        splitter(theme),
-        center_preview(center, theme),
-        splitter(theme),
-        right_sidebar(right, theme),
-    ))
-    .style(|s| s.size_full())
+    if show_center {
+        h_stack((
+            main_work(left, theme),
+            splitter(theme),
+            center_preview(center, theme),
+            splitter(theme),
+            right_sidebar(right, theme),
+        ))
+        .style(|s| s.size_full())
+    } else {
+        h_stack((main_work(left, theme), splitter(theme), right_sidebar(right, theme)))
+            .style(|s| s.size_full())
+    }
 }
 
 pub fn right_sidebar<V: IntoView + 'static>(content: V, theme: UiTheme) -> impl IntoView {
     Container::new(content).style(move |s| {
         s.width(260.0)
             .height_full()
+            .items_stretch()
             .background(theme.panel_bg)
     })
 }
@@ -77,7 +85,7 @@ pub fn main_work<V: IntoView + 'static>(content: V, theme: UiTheme) -> impl Into
 
 pub fn center_preview<V: IntoView + 'static>(content: V, theme: UiTheme) -> impl IntoView {
     Container::new(content).style(move |s| {
-        s.flex_grow(1.0)
+        s.flex_grow(0.0)
             .height_full()
             .width(0.0)
             .background(theme.surface)

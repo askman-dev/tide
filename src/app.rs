@@ -8,6 +8,7 @@ use crate::theme::UiTheme;
 use floem::prelude::*;
 use floem::views::Empty;
 use std::path::PathBuf;
+use crate::logging;
 
 pub fn app_view() -> impl IntoView {
     let theme = UiTheme::new();
@@ -57,6 +58,9 @@ pub fn app_view() -> impl IntoView {
         }
     });
 
+    if let Some(path) = logging::log_path() {
+        logging::log_line("INFO", &format!("log file: {}", path.display()));
+    }
     app_shell(v_stack((tabs_bar, content)), theme)
 }
 
@@ -64,13 +68,17 @@ fn workspace_view(tab: WorkspaceTab, theme: UiTheme) -> impl IntoView {
     let files_panel = panel_view(
         "Files",
         FOLDER,
-        file_tree_view(tab.file_tree, theme).scroll(),
+        file_tree_view(tab.file_tree, theme)
+            .scroll()
+            .style(|s| s.width_full()),
         theme,
     );
     let git_panel = panel_view(
         "Git",
         GIT,
-        git_status_view(tab.git_status, theme).scroll(),
+        git_status_view(tab.git_status, theme)
+            .scroll()
+            .style(|s| s.width_full()),
         theme,
     );
     let sidebar = sidebar_stack((files_panel, git_panel), theme);
@@ -79,6 +87,7 @@ fn workspace_view(tab: WorkspaceTab, theme: UiTheme) -> impl IntoView {
         Empty::new(),
         sidebar,
         theme,
+        false,
     )
 }
 

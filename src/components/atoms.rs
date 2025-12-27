@@ -46,6 +46,7 @@ pub fn list_item<V: IntoView + 'static>(content: V, indent: f32, theme: UiTheme)
     Container::new(content).style(move |s| {
         s.width_full()
             .height(LIST_HEIGHT)
+            .flex_row()
             .items_center()
             .padding_left(indent)
             .padding_right(8.0)
