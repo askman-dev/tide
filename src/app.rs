@@ -56,7 +56,8 @@ pub fn app_view() -> impl IntoView {
             Some(tab) => workspace_view(tab, theme).into_any(),
             None => Label::new("No workspace").into_any(),
         }
-    });
+    })
+    .style(|s| s.size_full().flex_grow(1.0));
 
     if let Some(path) = logging::log_path() {
         logging::log_line("INFO", &format!("log file: {}", path.display()));
