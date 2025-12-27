@@ -28,6 +28,7 @@ pub fn tab_bar<T: IntoView + 'static, A: IntoView + 'static>(
 pub fn app_shell<V: IntoView + 'static>(body: V, theme: UiTheme) -> impl IntoView {
     Container::new(body).style(move |s| {
         s.size_full()
+            .items_stretch()
             .background(theme.surface)
             .font_family("SF Pro Text, Avenir Next, Helvetica Neue".to_string())
             .font_size(13.0)

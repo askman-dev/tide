@@ -57,12 +57,12 @@ pub fn app_view() -> impl IntoView {
             None => Label::new("No workspace").into_any(),
         }
     })
-    .style(|s| s.size_full().flex_grow(1.0));
+    .style(|s| s.size_full().flex_grow(1.0).items_stretch());
 
     if let Some(path) = logging::log_path() {
         logging::log_line("INFO", &format!("log file: {}", path.display()));
     }
-    app_shell(v_stack((tabs_bar, content)), theme)
+    app_shell(v_stack((tabs_bar, content)).style(|s| s.size_full()), theme)
 }
 
 fn workspace_view(tab: WorkspaceTab, theme: UiTheme) -> impl IntoView {
