@@ -14,6 +14,7 @@ pub fn build_tree_entries(root: &Path, max_depth: usize) -> Vec<TreeEntry> {
         name: root_name,
         depth: 0,
         is_dir: true,
+        expanded: true,
     });
     visit_dir(root, 1, max_depth, &mut entries);
     entries
@@ -38,6 +39,7 @@ fn visit_dir(path: &Path, depth: usize, max_depth: usize, entries: &mut Vec<Tree
             name,
             depth,
             is_dir,
+            expanded: is_dir,
         });
         if is_dir {
             visit_dir(&path, depth + 1, max_depth, entries);
