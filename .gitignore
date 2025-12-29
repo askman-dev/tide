@@ -2,3 +2,10 @@
 /.gemini-clipboard/
 /target/
 .DS_Store
+
+# Common generated artifacts
+node_modules/
+dist/
+build/
+.cache/
+*.log

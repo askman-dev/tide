@@ -1,6 +1,6 @@
 use crate::components::{
-    app_shell, file_tree_view, git_status_view, main_layout, panel_view, tab_bar, tab_button, FILE,
-    FOLDER, GIT,
+    app_shell, file_tree_view, git_status_view, main_layout, panel_view, tab_bar, tab_button,
+    terminal_view, FILE, FOLDER, GIT,
 };
 use crate::model::WorkspaceTab;
 use crate::services::{build_tree_entries, git_status_entries};
@@ -71,12 +71,16 @@ pub fn app_view() -> impl IntoView {
 }
 
 fn workspace_view(tab: WorkspaceTab, theme: UiTheme) -> impl IntoView {
-    let project_header =
-        project_header_view(tab.name, tab.root.to_string_lossy().to_string(), theme);
+    let workspace_name = tab.name.clone();
+    let workspace_path = tab.root.to_string_lossy().to_string();
+    let file_tree_entries = tab.file_tree.clone();
+    let git_status_entries = tab.git_status.clone();
+
+    let project_header = project_header_view(workspace_name, workspace_path, theme);
     let files_panel = panel_view(
         "File explorer",
         FOLDER,
-        file_tree_view(tab.file_tree, theme)
+        file_tree_view(file_tree_entries, theme)
             .scroll()
             .style(|s| s.width_full().height_full()),
         theme,
@@ -84,7 +88,7 @@ fn workspace_view(tab: WorkspaceTab, theme: UiTheme) -> impl IntoView {
     let changes_panel = panel_view(
         "Changes",
         GIT,
-        git_status_view(tab.git_status, theme)
+        git_status_view(git_status_entries, theme)
             .scroll()
             .style(|s| s.width_full().height_full()),
         theme,
@@ -114,7 +118,7 @@ fn workspace_view(tab: WorkspaceTab, theme: UiTheme) -> impl IntoView {
             .padding(6.0)
     });
 
-    let center_column = chat_workspace_view(theme);
+    let center_column = terminal_view(theme, tab);
     let right_column = editor_workspace_view(theme);
 
     main_layout(left_column, center_column, right_column, theme)
