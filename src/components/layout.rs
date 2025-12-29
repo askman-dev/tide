@@ -1,6 +1,6 @@
-use crate::components::atoms::splitter;
 use crate::theme::UiTheme;
 use floem::prelude::*;
+use floem::style::{CustomStyle, CustomStylable};
 use floem::views::Empty;
 
 pub fn tab_bar<T: IntoView + 'static, A: IntoView + 'static>(
@@ -43,21 +43,33 @@ pub fn main_layout<L: IntoView + 'static, C: IntoView + 'static, R: IntoView + '
     center: C,
     right: R,
     theme: UiTheme,
-    show_center: bool,
 ) -> impl IntoView {
-    if show_center {
-        h_stack((
-            main_work(left, theme),
-            splitter(theme),
-            center_preview(center, theme),
-            splitter(theme),
-            right_sidebar(right, theme),
-        ))
+    let left = Container::new(left).style(move |s| {
+        s.width(260.0)
+            .min_width(200.0)
+            .height_full()
+            .background(theme.panel_bg)
+    });
+    let center = Container::new(center).style(move |s| {
+        s.flex_grow(1.0)
+            .min_width(360.0)
+            .height_full()
+            .background(theme.surface)
+    });
+    let right = Container::new(right).style(move |s| {
+        s.width(520.0)
+            .min_width(420.0)
+            .height_full()
+            .background(theme.panel_bg)
+    });
+
+    resizable::resizable((left, center, right))
         .style(|s| s.size_full())
-    } else {
-        h_stack((main_work(left, theme), splitter(theme), right_sidebar(right, theme)))
-            .style(|s| s.size_full())
-    }
+        .custom_style(move |s| {
+            s.handle_color(theme.border_subtle)
+                .handle_thickness(6.0)
+                .active(|s| s.handle_color(theme.accent))
+        })
 }
 
 pub fn right_sidebar<V: IntoView + 'static>(content: V, theme: UiTheme) -> impl IntoView {
