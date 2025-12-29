@@ -667,7 +667,7 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
             }
 
             if let Some(delta) = event.pixel_scroll_delta_vec2() {
-                let dy = -delta.y;
+                let dy = delta.y;
                 let lines = (dy / cell_height).round() as i32;
                 if lines != 0 {
                     session.scroll_display(lines);

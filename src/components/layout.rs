@@ -45,8 +45,7 @@ pub fn main_layout<L: IntoView + 'static, C: IntoView + 'static, R: IntoView + '
     theme: UiTheme,
 ) -> impl IntoView {
     let left = Container::new(left).style(move |s| {
-        s.width(260.0)
-            .min_width(200.0)
+        s.min_width(200.0)
             .height_full()
             .background(theme.panel_bg)
     });
@@ -57,8 +56,7 @@ pub fn main_layout<L: IntoView + 'static, C: IntoView + 'static, R: IntoView + '
             .background(theme.surface)
     });
     let right = Container::new(right).style(move |s| {
-        s.width(520.0)
-            .min_width(420.0)
+        s.min_width(420.0)
             .height_full()
             .background(theme.panel_bg)
     });

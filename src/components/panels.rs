@@ -16,7 +16,7 @@ pub fn panel_view<V: IntoView + 'static>(
         panel_header(header_title, icon_svg, theme),
         Container::new(body).style(move |s| {
             s.width_full()
-                .height_full()
+                .flex_grow(1.0)
                 .items_stretch()
                 .background(theme.panel_bg)
         }),
@@ -32,7 +32,6 @@ pub fn file_tree_view(entries: Vec<TreeEntry>, theme: UiTheme) -> impl IntoView 
         move |entry| {
             let indent = TREE_INDENT * entry.depth as f32;
             let is_dir = entry.is_dir;
-            let is_expanded = entry.expanded;
             let entry_id = entry.id.clone();
             let entry_path = entry.path.clone();
             let entry_depth = entry.depth;
@@ -66,7 +65,6 @@ pub fn file_tree_view(entries: Vec<TreeEntry>, theme: UiTheme) -> impl IntoView 
                         entry_id.clone(),
                         entry_path.clone(),
                         entry_depth,
-                        is_expanded,
                     );
                 })
                 .into_any()
@@ -100,13 +98,12 @@ fn toggle_dir(
     entry_id: String,
     entry_path: std::path::PathBuf,
     entry_depth: usize,
-    is_expanded: bool,
 ) {
     entries.update(|entries| {
         let Some(index) = entries.iter().position(|entry| entry.id == entry_id) else {
             return;
         };
-        if is_expanded {
+        if entries[index].expanded {
             entries[index].expanded = false;
             let mut remove_count = 0;
             for entry in entries.iter().skip(index + 1) {
