@@ -38,6 +38,7 @@ struct SplitDragCapture {
     right_width: RwSignal<f64>,
     drag: Option<DragState>,
     last_resize_log_at: Instant,
+    last_clamp_at: Instant,
 }
 
 impl SplitDragCapture {
@@ -56,6 +57,7 @@ impl SplitDragCapture {
             right_width,
             drag: None,
             last_resize_log_at: Instant::now(),
+            last_clamp_at: Instant::now(),
         }
     }
 
@@ -120,9 +122,20 @@ impl View for SplitDragCapture {
     fn event_before_children(&mut self, _cx: &mut EventCx, event: &Event) -> EventPropagation {
         match event {
             Event::WindowResized(size) => {
-                // Clamp widths so the center column doesn't collapse on resize.
-                // Avoid flooding logs while the user is live-resizing or entering fullscreen.
-                if self.last_resize_log_at.elapsed() >= Duration::from_millis(250) {
+                // Debounce clamp_widths during animations to avoid blocking UI thread.
+                // Only clamp when animation settles or at reasonable intervals.
+                let should_clamp = self.last_clamp_at.elapsed() >= Duration::from_millis(100);
+                
+                if should_clamp {
+                    self.clamp_widths();
+                    self.last_clamp_at = Instant::now();
+                }
+                
+                // Force immediate layout and repaint to avoid macOS showing stale scaled screenshots
+                self.id.request_layout();
+                
+                // Log less frequently to avoid spam
+                if self.last_resize_log_at.elapsed() >= Duration::from_millis(500) {
                     self.last_resize_log_at = Instant::now();
                     logging::log_line(
                         "INFO",
@@ -135,7 +148,6 @@ impl View for SplitDragCapture {
                         ),
                     );
                 }
-                self.clamp_widths();
                 EventPropagation::Continue
             }
             Event::Pointer(PointerEvent::Down(button_event)) => {

@@ -41,7 +41,7 @@ use floem::ui_events::pointer::{PointerButton, PointerEvent as UiPointerEvent};
 use std::sync::Arc;
 
 #[cfg(target_os = "macos")]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[cfg(target_os = "macos")]
 use std::ops::{Index, IndexMut};
@@ -303,9 +303,15 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
     let session = workspace.terminal;
     let error_msg: RwSignal<Option<String>> = RwSignal::new(None);
     let last_size: RwSignal<(u16, u16)> = RwSignal::new((0, 0));
+    let pending_size: RwSignal<(u16, u16)> = RwSignal::new((0, 0));
     let cell_size: RwSignal<(f64, f64)> = RwSignal::new((0.0, 0.0));
     let cell_y_offset: RwSignal<f64> = RwSignal::new(0.0);
     let last_pty_resize_at: RwSignal<Instant> = RwSignal::new(Instant::now());
+    let ime_focused: RwSignal<bool> = RwSignal::new(false);
+    let ime_update_tick: RwSignal<u64> = RwSignal::new(0);
+    let last_ime_cursor_area: RwSignal<Option<(floem::kurbo::Point, floem::kurbo::Size)>> =
+        RwSignal::new(None);
+    let last_canvas_size: RwSignal<(f64, f64)> = RwSignal::new((0.0, 0.0));
     // Trigger repaints when terminal content changes (from background thread).
     let term_update_trigger = workspace.terminal_trigger;
 
@@ -367,9 +373,14 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
             };
 
             // 4. Measure (and cache) cell size.
-            // Doing this per-frame is expensive and also makes live-resize/fullscreen feel laggy.
+            // Recalculate on every canvas size change to ensure accurate layout.
+            // TextLayout measurement is fast enough to do this every frame during resize.
+            let (prev_canvas_width, prev_canvas_height) = last_canvas_size.get_untracked();
+            let canvas_size_changed = (size.width - prev_canvas_width).abs() > 1.0
+                || (size.height - prev_canvas_height).abs() > 1.0;
+            
             let (mut cell_width, mut cell_height) = cell_size.get_untracked();
-            if cell_width <= 0.0 || cell_height <= 0.0 {
+            if cell_width <= 0.0 || cell_height <= 0.0 || canvas_size_changed {
                 let attrs = Attrs::new()
                     .font_size(TERMINAL_FONT_SIZE)
                     .family(&font_families);
@@ -382,6 +393,15 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
                 cell_height = (metrics_size.height * 1.25).max(1.0);
                 cell_size.set((cell_width, cell_height));
                 cell_y_offset.set((cell_height - metrics_size.height) / 2.0);
+                
+                if canvas_size_changed {
+                    last_canvas_size.set((size.width, size.height));
+                    crate::logging::log_line(
+                        "INFO",
+                        &format!("cell_size recalculated: {:.1}x{:.1} (canvas: {:.0}x{:.0})",
+                                 cell_width, cell_height, size.width, size.height),
+                    );
+                }
             }
 
             let y_offset = cell_y_offset.get_untracked();
@@ -396,35 +416,19 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
             {
                 let (prev_cols, prev_rows) = last_size.get_untracked();
                 if cols != prev_cols || rows != prev_rows {
-                    // Debounce PTY resize during window zoom/fullscreen animations.
-                    // Fullscreen transitions can emit many intermediate sizes; resizing
-                    // the PTY every frame causes huge reflow work and makes the OS
-                    // keep showing a scaled snapshot (blurry) for longer.
-                    let should_resize = if prev_cols == 0 || prev_rows == 0 {
-                        true
-                    } else if cols.abs_diff(prev_cols) >= 12 || rows.abs_diff(prev_rows) >= 6 {
-                        true
-                    } else {
-                        last_pty_resize_at
-                            .get_untracked()
-                            .elapsed()
-                            >= Duration::from_millis(50)
-                    };
-
-                    if !should_resize {
-                        // Keep rendering at the previous grid size until the animation settles.
-                        // The canvas background will cover the rest of the area.
-                    } else if let Err(err) = session.resize(cols, rows) {
-                        crate::logging::log_line(
-                            "ERROR",
-                            &format!("Terminal resize failed: {err}"),
-                        );
-                    } else {
-                        last_size.set((cols, rows));
-                        last_pty_resize_at.set(Instant::now());
-                    }
+                    // Don't resize PTY here - just update pending_size signal.
+                    // A separate Effect will handle the actual resize asynchronously
+                    // to avoid blocking the render loop.
+                    pending_size.set((cols, rows));
+                    crate::logging::log_line(
+                        "INFO",
+                        &format!("Pending PTY resize: {}x{} (was {}x{})", cols, rows, prev_cols, prev_rows),
+                    );
                 }
             }
+
+            // Render using last_size, not pending_size, to avoid flicker
+            let (cols, rows) = last_size.get_untracked();
 
             // 6. Render content
             let palette = TerminalPalette::for_theme(theme);
@@ -619,40 +623,87 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
     // Effect to update IME cursor position based on terminal cursor
     Effect::new(move |_| {
         cell_size.track();
+        session.track();
+        term_update_trigger.track();
+        ime_focused.track();
+        ime_update_tick.track();
         
         let (cell_width, cell_height) = cell_size.get_untracked();
         let canvas_rect = terminal_wrapper_id.layout_rect();
         
-        if cell_width > 0.0 && cell_height > 0.0 && canvas_rect.width() > 0.0 {
+        if !ime_focused.get_untracked() {
+            last_ime_cursor_area.set(None);
+            return;
+        }
+
+        if cell_width <= 0.0 || cell_height <= 0.0 || canvas_rect.width() <= 0.0 {
+            return;
+        }
+
+        let Some(sess) = session.get_untracked() else {
+            return;
+        };
+        if !sess.is_active() {
+            return;
+        }
+
+        let next = sess.with_term(|term| {
+            let content = term.renderable_content();
+            let cursor = content.cursor;
+            let display_offset = content.display_offset;
+
+            let viewport_cursor = point_to_viewport(display_offset, cursor.point)?;
+            let col = viewport_cursor.column.0 as f64;
+            let row = viewport_cursor.line as f64;
+
+            // `canvas_rect` is window-relative; anchor the IME at the caret cell rect.
+            let x = canvas_rect.x0 + col * cell_width;
+            let y = canvas_rect.y0 + row * cell_height;
+            Some((
+                floem::kurbo::Point::new(x, y),
+                floem::kurbo::Size::new(cell_width, cell_height),
+            ))
+        });
+
+        let Some((pos, size)) = next else {
+            return;
+        };
+
+        let should_send = match last_ime_cursor_area.get_untracked() {
+            None => true,
+            Some((prev_pos, prev_size)) => {
+                let moved = (prev_pos.x - pos.x).abs() >= 0.5 || (prev_pos.y - pos.y).abs() >= 0.5;
+                let resized = (prev_size.width - size.width).abs() >= 0.5
+                    || (prev_size.height - size.height).abs() >= 0.5;
+                moved || resized
+            }
+        };
+
+        if should_send {
+            floem::action::set_ime_cursor_area(pos, size);
+            last_ime_cursor_area.set(Some((pos, size)));
+        }
+    });
+
+    // Effect to handle PTY resize asynchronously (not in render loop)
+    Effect::new(move |_| {
+        let (pending_cols, pending_rows) = pending_size.get();
+        let (last_cols, last_rows) = last_size.get_untracked();
+        
+        if pending_cols != last_cols || pending_rows != last_rows {
             if let Some(sess) = session.get_untracked() {
-                if sess.is_active() {
-                    sess.with_term(|term| {
-                        let content = term.renderable_content();
-                        let cursor = content.cursor;
-                        let display_offset = content.display_offset;
-                        
-                        if let Some(viewport_cursor) = point_to_viewport(display_offset, cursor.point) {
-                            let col = viewport_cursor.column.0 as f64;
-                            let row = viewport_cursor.line as f64;
-                            
-                            // Calculate cursor position
-                            // Use canvas_rect to get position in window
-                            let x = canvas_rect.x0 + col * cell_width + 8.0;
-                            // Position IME at bottom of cursor cell
-                            let y = canvas_rect.y0 + (row + 1.0) * cell_height + 8.0;
-                            
-                            crate::logging::log_line(
-                                "DEBUG",
-                                &format!("IME: col={} row={} canvas=({:.1},{:.1}) cell=({:.1},{:.1}) final=({:.1},{:.1})", 
-                                    col, row, canvas_rect.x0, canvas_rect.y0, cell_width, cell_height, x, y)
-                            );
-                            
-                            floem::action::set_ime_cursor_area(
-                                floem::kurbo::Point::new(x, y),
-                                floem::kurbo::Size::new(cell_width, cell_height),
-                            );
-                        }
-                    });
+                if let Err(err) = sess.resize(pending_cols, pending_rows) {
+                    crate::logging::log_line(
+                        "ERROR",
+                        &format!("Terminal resize failed: {err}"),
+                    );
+                } else {
+                    last_size.set((pending_cols, pending_rows));
+                    last_pty_resize_at.set(Instant::now());
+                    crate::logging::log_line(
+                        "INFO",
+                        &format!("PTY resized: {}x{} (was {}x{})", pending_cols, pending_rows, last_cols, last_rows),
+                    );
                 }
             }
         }
@@ -665,15 +716,24 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
                 .background(theme.panel_bg)
                 .focusable(true)
         })
+        .on_event_cont(EventListener::WindowResized, move |_| {
+            ime_update_tick.update(|tick| *tick = tick.wrapping_add(1));
+        })
         .on_event(EventListener::FocusGained, move |_| {
             logging::breadcrumb("terminal focus gained".to_string());
+            ime_focused.set(true);
+            ime_update_tick.update(|tick| *tick = tick.wrapping_add(1));
             floem::action::set_ime_allowed(true);
             EventPropagation::Continue
         })
         .on_event(EventListener::FocusLost, move |_| {
             logging::breadcrumb("terminal focus lost".to_string());
+            ime_focused.set(false);
             floem::action::set_ime_allowed(false);
             EventPropagation::Continue
+        })
+        .on_event_cont(EventListener::ImePreedit, move |_| {
+            ime_update_tick.update(|tick| *tick = tick.wrapping_add(1));
         })
         .on_event(EventListener::KeyDown, move |event| {
             logging::measure_ui_event("terminal keydown", || {
@@ -693,6 +753,7 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
                             ));
                         }
                     }
+                    ime_update_tick.update(|tick| *tick = tick.wrapping_add(1));
 
                     // Check for restart if session is inactive
                     if let Some(session_arc) = session.get_untracked() {
@@ -830,6 +891,7 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
             logging::measure_ui_event("terminal ime commit", || {
                 if let Event::ImeCommit(text) = event {
                     logging::breadcrumb(format!("terminal ime commit: len={}", text.len()));
+                    ime_update_tick.update(|tick| *tick = tick.wrapping_add(1));
                     
                     let Some(session) = session.get_untracked() else {
                         return EventPropagation::Continue;
