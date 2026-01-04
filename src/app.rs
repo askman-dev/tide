@@ -5,12 +5,19 @@ use crate::components::{
 use crate::model::WorkspaceTab;
 use crate::services::{build_tree_entries, git_status_entries};
 use crate::theme::UiTheme;
+use floem::ext_event::{register_ext_trigger, ExtSendTrigger};
 use floem::prelude::*;
+use floem::reactive::Effect;
 use crate::logging;
 use std::path::PathBuf;
+use std::sync::OnceLock;
+use std::time::Duration;
+
+static UI_WATCHDOG: OnceLock<()> = OnceLock::new();
 
 pub fn app_view() -> impl IntoView {
     let theme = UiTheme::new();
+    install_ui_watchdog();
     let initial_root = std::env::var("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
@@ -28,7 +35,10 @@ pub fn app_view() -> impl IntoView {
                 tab_name,
                 move || active_tab.get() == tab_id,
                 theme,
-                move || active_tab.set(tab_id),
+                move || {
+                    logging::breadcrumb(format!("tab select: id={tab_id}"));
+                    active_tab.set(tab_id);
+                },
             )
         },
     );
@@ -47,6 +57,11 @@ pub fn app_view() -> impl IntoView {
                 .find(|tab| tab.id == active_id)
                 .map(|tab| tab.root)
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+            logging::breadcrumb(format!("new tab click: id={id}"));
+            logging::log_line(
+                "INFO",
+                &format!("new tab: id={id} root={}", root.display()),
+            );
             tabs.update(|tabs| tabs.push(build_tab(id, root)));
             active_tab.set(id);
         },
@@ -68,6 +83,30 @@ pub fn app_view() -> impl IntoView {
         logging::log_line("INFO", &format!("log file: {}", path.display()));
     }
     app_shell(v_stack((tabs_bar, content)).style(|s| s.size_full()), theme)
+}
+
+fn install_ui_watchdog() {
+    if UI_WATCHDOG.set(()).is_err() {
+        return;
+    }
+
+    const PING_INTERVAL: Duration = Duration::from_millis(500);
+    const STALE_AFTER: Duration = Duration::from_secs(2);
+
+    let heartbeat_trigger = ExtSendTrigger::new();
+    Effect::new(move |_| {
+        heartbeat_trigger.track();
+        logging::touch_heartbeat();
+    });
+
+    logging::touch_heartbeat();
+    logging::log_line("INFO", "UI watchdog started");
+
+    std::thread::spawn(move || loop {
+        std::thread::sleep(PING_INTERVAL);
+        register_ext_trigger(heartbeat_trigger);
+        logging::check_heartbeat(STALE_AFTER);
+    });
 }
 
 fn workspace_view(tab: WorkspaceTab, theme: UiTheme) -> impl IntoView {

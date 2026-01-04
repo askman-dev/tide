@@ -17,9 +17,10 @@ mod platform {
     use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
     use std::io::{self, Read, Write};
     use std::path::Path;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread::{self, JoinHandle};
+    use std::time::Instant;
 
     #[derive(Clone)]
     pub struct TideEventListener {
@@ -123,6 +124,9 @@ mod platform {
         pty_writer: Arc<Mutex<Box<dyn Write + Send>>>,
         scrollback: usize,
         alive: Arc<AtomicBool>,
+        bytes_read: Arc<AtomicU64>,
+        bytes_written: AtomicU64,
+        notify: Arc<dyn Fn() + Send + Sync>,
         io_thread: Option<JoinHandle<()>>,
     }
 
@@ -131,7 +135,10 @@ mod platform {
         ///
         /// This uses a fixed 80x24 cell grid for now; Floem-driven sizing
         /// will be hooked up in a later step.
-        pub fn new(workspace_root: &Path) -> io::Result<Arc<Self>> {
+        pub fn new(
+            workspace_root: &Path,
+            notify: Arc<dyn Fn() + Send + Sync>,
+        ) -> io::Result<Arc<Self>> {
             const DEFAULT_COLS: u16 = 80;
             const DEFAULT_ROWS: u16 = 24;
             const MIN_SCROLLBACK: usize = 500;
@@ -187,6 +194,7 @@ mod platform {
             let pty_writer = Arc::new(Mutex::new(writer));
 
             let alive = Arc::new(AtomicBool::new(true));
+            let bytes_read = Arc::new(AtomicU64::new(0));
 
             // Create terminal state with configured scrollback and event listener.
             let term = Term::new(
@@ -204,12 +212,16 @@ mod platform {
 
             let term_for_thread = Arc::clone(&term);
             let alive_for_thread = Arc::clone(&alive);
+            let bytes_read_for_thread = Arc::clone(&bytes_read);
+            let notify_for_thread = Arc::clone(&notify);
 
             let io_thread = thread::Builder::new()
                 .name("tide-terminal-io".to_string())
                 .spawn(move || {
+                    logging::log_line("INFO", "Terminal IO thread started");
                     let mut parser = Processor::<StdSyncHandler>::new();
                     let mut buf = [0u8; 4096];
+                    let mut total_bytes: u64 = 0;
 
                     while alive_for_thread.load(Ordering::SeqCst) {
                         match reader.read(&mut buf) {
@@ -222,10 +234,22 @@ mod platform {
                             }
                             Ok(n) => {
                                 let chunk = &buf[..n];
+                                let parse_start = Instant::now();
                                 {
                                     let mut term = term_for_thread.lock();
                                     parser.advance(&mut *term, chunk);
                                 }
+                                notify_for_thread();
+                                logging::log_slow_op(
+                                    "pty parse",
+                                    parse_start.elapsed(),
+                                    &format!("bytes={n}"),
+                                );
+                                total_bytes += n as u64;
+                                bytes_read_for_thread.fetch_add(
+                                    n as u64,
+                                    Ordering::Relaxed,
+                                );
                             }
                             Err(err) => {
                                 logging::log_line(
@@ -238,6 +262,12 @@ mod platform {
                     }
 
                     alive_for_thread.store(false, Ordering::SeqCst);
+                    logging::log_line(
+                        "INFO",
+                        &format!(
+                            "Terminal IO thread exiting (bytes_read={total_bytes})"
+                        ),
+                    );
                 })?;
 
             let session = TerminalSession {
@@ -246,6 +276,9 @@ mod platform {
                 pty_writer,
                 scrollback,
                 alive,
+                bytes_read,
+                bytes_written: AtomicU64::new(0),
+                notify,
                 io_thread: Some(io_thread),
             };
 
@@ -264,7 +297,18 @@ mod platform {
                 .lock()
                 .expect("pty_writer mutex poisoned");
 
-            writer.write_all(bytes)
+            let start = Instant::now();
+            let result = writer.write_all(bytes);
+            if result.is_ok() {
+                self.bytes_written
+                    .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            }
+            logging::log_slow_op(
+                "pty write",
+                start.elapsed(),
+                &format!("bytes={}", bytes.len()),
+            );
+            result
         }
 
         /// Resize both the PTY and the terminal grid.
@@ -319,13 +363,37 @@ mod platform {
 
     impl Drop for TerminalSession {
         fn drop(&mut self) {
+            logging::breadcrumb("TerminalSession::drop started");
             self.alive.store(false, Ordering::SeqCst);
+            logging::log_line(
+                "INFO",
+                &format!(
+                    "Dropping TerminalSession (bytes_read={} bytes_written={})",
+                    self.bytes_read.load(Ordering::Relaxed),
+                    self.bytes_written.load(Ordering::Relaxed),
+                ),
+            );
 
             if let Some(handle) = self.io_thread.take() {
-                if let Err(err) = handle.join() {
+                logging::breadcrumb("TerminalSession joining IO thread (background)");
+                let joiner = thread::Builder::new()
+                    .name("tide-terminal-join".to_string())
+                    .spawn(move || match handle.join() {
+                        Ok(()) => {
+                            logging::breadcrumb("TerminalSession IO thread joined: true");
+                        }
+                        Err(err) => {
+                            logging::log_line(
+                                "ERROR",
+                                &format!("Terminal IO thread join failed: {err:?}"),
+                            );
+                            logging::breadcrumb("TerminalSession IO thread joined: false");
+                        }
+                    });
+                if let Err(err) = joiner {
                     logging::log_line(
                         "ERROR",
-                        &format!("Terminal IO thread join failed: {err:?}"),
+                        &format!("Terminal join thread spawn failed: {err:?}"),
                     );
                 }
             }
@@ -345,7 +413,10 @@ mod platform {
 
     impl TerminalSession {
         /// Create a new stub terminal session.
-        pub fn new(workspace_root: &Path) -> io::Result<Arc<Self>> {
+        pub fn new(
+            workspace_root: &Path,
+            _notify: Arc<dyn Fn() + Send + Sync>,
+        ) -> io::Result<Arc<Self>> {
             logging::log_line(
                 "WARN",
                 &format!(
@@ -382,11 +453,13 @@ pub use platform::TerminalSession;
 mod tests {
     use super::TerminalSession;
     use std::env;
+    use std::sync::Arc;
 
     #[test]
     fn terminal_session_new_succeeds() {
         let root = env::current_dir().unwrap();
-        let session = TerminalSession::new(&root).expect("terminal session should construct");
+        let session = TerminalSession::new(&root, Arc::new(|| {}))
+            .expect("terminal session should construct");
         let _ = session;
     }
 
@@ -394,7 +467,8 @@ mod tests {
     #[test]
     fn terminal_session_scrollback_at_least_500() {
         let root = env::current_dir().unwrap();
-        let session = TerminalSession::new(&root).expect("terminal session should construct");
+        let session = TerminalSession::new(&root, Arc::new(|| {}))
+            .expect("terminal session should construct");
         assert!(session.scrollback() >= 500);
     }
 }

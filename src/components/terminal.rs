@@ -5,6 +5,9 @@ use crate::theme::{TerminalPalette, UiTheme};
 use floem::prelude::*;
 
 #[cfg(target_os = "macos")]
+use crate::logging;
+
+#[cfg(target_os = "macos")]
 use alacritty_terminal::{
     grid::{Dimensions, Indexed},
     index::{Column, Side},
@@ -22,11 +25,12 @@ use alacritty_terminal::{
 #[cfg(target_os = "macos")]
 use floem::{
     event::{Event, EventListener, EventPropagation},
+    ext_event::{register_ext_trigger, ExtSendTrigger},
     peniko::{
         kurbo::Rect,
         Brush, Color,
     },
-    reactive::{RwSignal, Effect},
+    reactive::{Effect, RwSignal},
     text::{Attrs, AttrsList, FamilyOwned, TextLayout},
 };
 
@@ -35,6 +39,9 @@ use floem::ui_events::pointer::{PointerButton, PointerEvent as UiPointerEvent};
 
 #[cfg(target_os = "macos")]
 use std::sync::Arc;
+
+#[cfg(target_os = "macos")]
+use std::time::Instant;
 
 #[cfg(target_os = "macos")]
 use std::ops::{Index, IndexMut};
@@ -300,11 +307,15 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
     let error_msg: RwSignal<Option<String>> = RwSignal::new(None);
     let last_size: RwSignal<(u16, u16)> = RwSignal::new((0, 0));
     let cell_size: RwSignal<(f64, f64)> = RwSignal::new((0.0, 0.0));
+    // Trigger repaints when terminal content changes (from background thread).
+    let term_update_trigger = ExtSendTrigger::new();
 
     let terminal_canvas = canvas({
         let workspace_root = workspace_root.clone();
         move |cx, size| {
             let font_families = terminal_font_families();
+            let render_start = Instant::now();
+            let mut rendered_cells: usize = 0;
 
             // 1. Draw background
             let bg_rect = Rect::new(0.0, 0.0, size.width, size.height);
@@ -329,7 +340,15 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
             // 3. Initialize session if needed
             let mut current_session = session.get_untracked();
             if current_session.is_none() {
-                match TerminalSession::new(&workspace_root) {
+                // Callback to trigger repaint from IO thread
+                let notify = {
+                    let term_update_trigger = term_update_trigger;
+                    Arc::new(move || {
+                        register_ext_trigger(term_update_trigger);
+                    })
+                };
+
+                match TerminalSession::new(&workspace_root, notify) {
                     Ok(new_session) => {
                         current_session = Some(new_session.clone());
                         session.set(Some(new_session));
@@ -390,6 +409,7 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
                 let term_colors = content.colors;
 
                 for indexed in content.display_iter.by_ref() {
+                    rendered_cells += 1;
                     let viewport_point =
                         match point_to_viewport(content.display_offset, indexed.point) {
                             Some(p) => p,
@@ -501,6 +521,13 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
                 let sy = y + text_size.height + 8.0;
                 cx.draw_text(&layout_sub, floem::kurbo::Point::new(sx, sy));
             }
+
+            logging::record_terminal_render(
+                render_start.elapsed(),
+                rendered_cells,
+                cols,
+                rows,
+            );
         }
     });
 
@@ -510,6 +537,7 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
     Effect::new(move |_| {
         session.track();
         error_msg.track();
+        term_update_trigger.track();
         canvas_id.request_paint();
     });
 
@@ -521,307 +549,336 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
                 .focusable(true)
         })
         .on_event(EventListener::KeyDown, move |event| {
-            if let Event::Key(key_event) = event {
-                if key_event.state != KeyState::Down {
-                    return EventPropagation::Continue;
-                }
+            logging::measure_ui_event("terminal keydown", || {
+                if let Event::Key(key_event) = event {
+                    if key_event.state != KeyState::Down {
+                        return EventPropagation::Continue;
+                    }
 
-                // Check for restart if session is inactive
-                if let Some(session_arc) = session.get_untracked() {
-                    if !session_arc.is_active() {
-                        if key_event.key == Key::Named(NamedKey::Enter) {
+                    match &key_event.key {
+                        Key::Named(named) => {
+                            logging::breadcrumb(format!("terminal keydown: {named:?}"));
+                        }
+                        Key::Character(text) => {
+                            logging::breadcrumb(format!(
+                                "terminal keydown: char len={}",
+                                text.len()
+                            ));
+                        }
+                        _ => {
+                            logging::breadcrumb("terminal keydown".to_string());
+                        }
+                    }
+
+                    // Check for restart if session is inactive
+                    if let Some(session_arc) = session.get_untracked() {
+                        if !session_arc.is_active() {
+                            if key_event.key == Key::Named(NamedKey::Enter) {
+                                logging::breadcrumb("terminal restart".to_string());
+                                session.set(None);
+                                error_msg.set(None);
+                                return EventPropagation::Stop;
+                            }
+                            return EventPropagation::Stop; // Consume keys when dead
+                        }
+                    }
+
+                    // Check for restart if we have an error (e.g. failed to start)
+                    if error_msg.get_untracked().is_some() {
+                         if key_event.key == Key::Named(NamedKey::Enter) {
+                            logging::breadcrumb("terminal restart (error)".to_string());
                             session.set(None);
                             error_msg.set(None);
                             return EventPropagation::Stop;
                         }
-                        return EventPropagation::Stop; // Consume keys when dead
                     }
+
+                    let Some(session) = session.get_untracked() else {
+                        return EventPropagation::Continue;
+                    };
+
+                    let key = &key_event.key;
+                    let modifiers = key_event.modifiers;
+
+                    // Handle Cmd+C / Cmd+V for clipboard integration.
+                    if modifiers.meta() {
+                        if let Key::Character(ch) = key {
+                            if ch.eq_ignore_ascii_case("c") {
+                                let selection =
+                                    session.with_term(|term| term.selection_to_string());
+
+                                if let Some(text) = selection {
+                                    crate::services::set_clipboard_string(&text);
+                                } else if let Err(err) =
+                                    session.write(&[0x03])
+                                {
+                                    crate::logging::log_line(
+                                        "ERROR",
+                                        &format!(
+                                            "Terminal write failed for Cmd+C: {err}"
+                                        ),
+                                    );
+                                }
+
+                                return EventPropagation::Stop;
+                            } else if ch.eq_ignore_ascii_case("v") {
+                                if let Some(text) =
+                                    crate::services::get_clipboard_string()
+                                {
+                                    let normalized = text
+                                        .replace("\r\n", "\n")
+                                        .replace('\r', "\n");
+
+                                    if !normalized.is_empty() {
+                                        if let Err(err) =
+                                            session.write(normalized.as_bytes())
+                                        {
+                                            crate::logging::log_line(
+                                                "ERROR",
+                                                &format!(
+                                                    "Terminal write failed for Cmd+V: {err}"
+                                                ),
+                                            );
+                                        }
+                                    }
+                                }
+
+                                return EventPropagation::Stop;
+                            }
+                        }
+                    }
+
+                    let mut handled = false;
+
+                    match key {
+                        Key::Character(text) => {
+                            if !text.is_empty() {
+                                if let Err(err) = session.write(text.as_bytes()) {
+                                    crate::logging::log_line(
+                                        "ERROR",
+                                        &format!("Terminal write failed: {err}"),
+                                    );
+                                }
+                                handled = true;
+                            }
+                        }
+                        Key::Named(named) => {
+                            let bytes: Option<&[u8]> = match named {
+                                NamedKey::Enter => Some(b"\r"),
+                                NamedKey::Tab => Some(b"\t"),
+                                NamedKey::Backspace => Some(&[0x7f]),
+                                NamedKey::Escape => Some(b"\x1b"),
+                                NamedKey::ArrowUp => Some(b"\x1b[A"),
+                                NamedKey::ArrowDown => Some(b"\x1b[B"),
+                                NamedKey::ArrowRight => Some(b"\x1b[C"),
+                                NamedKey::ArrowLeft => Some(b"\x1b[D"),
+                                NamedKey::Home => Some(b"\x1b[H"),
+                                NamedKey::End => Some(b"\x1b[F"),
+                                NamedKey::PageUp => Some(b"\x1b[5~"),
+                                NamedKey::PageDown => Some(b"\x1b[6~"),
+                                NamedKey::Delete => Some(b"\x1b[3~"),
+                                _ => None,
+                            };
+
+                            if let Some(bytes) = bytes {
+                                if let Err(err) = session.write(bytes) {
+                                    crate::logging::log_line(
+                                        "ERROR",
+                                        &format!("Terminal write failed: {err}"),
+                                    );
+                                }
+                                handled = true;
+                            }
+                        }
+                    }
+
+                    if handled {
+                        EventPropagation::Stop
+                    } else {
+                        EventPropagation::Continue
+                    }
+                } else {
+                    EventPropagation::Continue
+                }
+            })
+        })
+        .on_event(EventListener::PointerWheel, move |event| {
+            logging::measure_ui_event("terminal scroll", || {
+                let Some(session) = session.get_untracked() else {
+                    return EventPropagation::Continue;
+                };
+                if !session.is_active() { return EventPropagation::Continue; }
+
+                let (_, cell_height) = cell_size.get_untracked();
+                if cell_height <= 0.0 {
+                    return EventPropagation::Continue;
                 }
 
-                // Check for restart if we have an error (e.g. failed to start)
-                if error_msg.get_untracked().is_some() {
-                     if key_event.key == Key::Named(NamedKey::Enter) {
-                        session.set(None);
-                        error_msg.set(None);
+                if let Some(delta) = event.pixel_scroll_delta_vec2() {
+                    let dy = delta.y;
+                    let lines = (dy / cell_height).round() as i32;
+                    if lines != 0 {
+                        logging::breadcrumb(format!("terminal scroll: {lines}"));
+                        session.scroll_display(lines);
                         return EventPropagation::Stop;
                     }
                 }
 
+                EventPropagation::Continue
+            })
+        })
+        .on_event(EventListener::PointerDown, move |event| {
+            logging::measure_ui_event("terminal pointer down", || {
                 let Some(session) = session.get_untracked() else {
                     return EventPropagation::Continue;
                 };
 
-                let key = &key_event.key;
-                let modifiers = key_event.modifiers;
-
-                // Handle Cmd+C / Cmd+V for clipboard integration.
-                if modifiers.meta() {
-                    if let Key::Character(ch) = key {
-                        if ch.eq_ignore_ascii_case("c") {
-                            let selection =
-                                session.with_term(|term| term.selection_to_string());
-
-                            if let Some(text) = selection {
-                                crate::services::set_clipboard_string(&text);
-                            } else if let Err(err) =
-                                session.write(&[0x03])
-                            {
-                                crate::logging::log_line(
-                                    "ERROR",
-                                    &format!(
-                                        "Terminal write failed for Cmd+C: {err}"
-                                    ),
-                                );
-                            }
-
-                            return EventPropagation::Stop;
-                        } else if ch.eq_ignore_ascii_case("v") {
-                            if let Some(text) =
-                                crate::services::get_clipboard_string()
-                            {
-                                let normalized = text
-                                    .replace("\r\n", "\n")
-                                    .replace('\r', "\n");
-
-                                if !normalized.is_empty() {
-                                    if let Err(err) =
-                                        session.write(normalized.as_bytes())
-                                    {
-                                        crate::logging::log_line(
-                                            "ERROR",
-                                            &format!(
-                                                "Terminal write failed for Cmd+V: {err}"
-                                            ),
-                                        );
-                                    }
-                                }
-                            }
-
-                            return EventPropagation::Stop;
-                        }
-                    }
-                }
-
-                let mut handled = false;
-
-                match key {
-                    Key::Character(text) => {
-                        if !text.is_empty() {
-                            if let Err(err) = session.write(text.as_bytes()) {
-                                crate::logging::log_line(
-                                    "ERROR",
-                                    &format!("Terminal write failed: {err}"),
-                                );
-                            }
-                            handled = true;
-                        }
-                    }
-                    Key::Named(named) => {
-                        let bytes: Option<&[u8]> = match named {
-                            NamedKey::Enter => Some(b"\r"),
-                            NamedKey::Tab => Some(b"\t"),
-                            NamedKey::Backspace => Some(&[0x7f]),
-                            NamedKey::Escape => Some(b"\x1b"),
-                            NamedKey::ArrowUp => Some(b"\x1b[A"),
-                            NamedKey::ArrowDown => Some(b"\x1b[B"),
-                            NamedKey::ArrowRight => Some(b"\x1b[C"),
-                            NamedKey::ArrowLeft => Some(b"\x1b[D"),
-                            NamedKey::Home => Some(b"\x1b[H"),
-                            NamedKey::End => Some(b"\x1b[F"),
-                            NamedKey::PageUp => Some(b"\x1b[5~"),
-                            NamedKey::PageDown => Some(b"\x1b[6~"),
-                            NamedKey::Delete => Some(b"\x1b[3~"),
-                            _ => None,
-                        };
-
-                        if let Some(bytes) = bytes {
-                            if let Err(err) = session.write(bytes) {
-                                crate::logging::log_line(
-                                    "ERROR",
-                                    &format!("Terminal write failed: {err}"),
-                                );
-                            }
-                            handled = true;
-                        }
-                    }
-                }
-
-                if handled {
-                    EventPropagation::Stop
-                } else {
-                    EventPropagation::Continue
-                }
-            } else {
-                EventPropagation::Continue
-            }
-        })
-        .on_event(EventListener::PointerWheel, move |event| {
-            let Some(session) = session.get_untracked() else {
-                return EventPropagation::Continue;
-            };
-            if !session.is_active() { return EventPropagation::Continue; }
-
-            let (_, cell_height) = cell_size.get_untracked();
-            if cell_height <= 0.0 {
-                return EventPropagation::Continue;
-            }
-
-            if let Some(delta) = event.pixel_scroll_delta_vec2() {
-                let dy = delta.y;
-                let lines = (dy / cell_height).round() as i32;
-                if lines != 0 {
-                    session.scroll_display(lines);
-                    return EventPropagation::Stop;
-                }
-            }
-
-            EventPropagation::Continue
-        })
-        .on_event(EventListener::PointerDown, move |event| {
-            let Some(session) = session.get_untracked() else {
-                return EventPropagation::Continue;
-            };
-
-            let (cell_width, cell_height) = cell_size.get_untracked();
-            if cell_width <= 0.0 || cell_height <= 0.0 {
-                return EventPropagation::Continue;
-            }
-
-            if let Event::Pointer(UiPointerEvent::Down(button_event)) = event {
-                if button_event.button != Some(PointerButton::Primary) {
+                let (cell_width, cell_height) = cell_size.get_untracked();
+                if cell_width <= 0.0 || cell_height <= 0.0 {
                     return EventPropagation::Continue;
                 }
 
-                if let Some(pos) = event.point() {
-                    canvas_id.request_focus();
-                    canvas_id.request_active();
+                if let Event::Pointer(UiPointerEvent::Down(button_event)) = event {
+                    if button_event.button != Some(PointerButton::Primary) {
+                        return EventPropagation::Continue;
+                    }
 
-                    let x = pos.x;
-                    let y = pos.y;
+                    if let Some(pos) = event.point() {
+                        logging::breadcrumb("terminal pointer down".to_string());
+                        canvas_id.request_focus();
+                        canvas_id.request_active();
 
-                    session.with_term_mut(|term| {
-                        let (cols, lines, display_offset) = {
-                            let grid = term.grid();
-                            (grid.columns(), grid.screen_lines(), grid.display_offset())
-                        };
+                        let x = pos.x;
+                        let y = pos.y;
 
-                        if cols == 0 || lines == 0 {
-                            return;
-                        }
+                        session.with_term_mut(|term| {
+                            let (cols, lines, display_offset) = {
+                                let grid = term.grid();
+                                (grid.columns(), grid.screen_lines(), grid.display_offset())
+                            };
 
-                        let col = (x / cell_width).floor() as isize;
-                        let line = (y / cell_height).floor() as isize;
+                            if cols == 0 || lines == 0 {
+                                return;
+                            }
 
-                        if col < 0 || line < 0 {
-                            return;
-                        }
+                            let col = (x / cell_width).floor() as isize;
+                            let line = (y / cell_height).floor() as isize;
 
-                        let mut col = col as usize;
-                        let mut line = line as usize;
+                            if col < 0 || line < 0 {
+                                return;
+                            }
 
-                        if col >= cols {
-                            col = cols - 1;
-                        }
-                        if line >= lines {
-                            line = lines - 1;
-                        }
+                            let mut col = col as usize;
+                            let mut line = line as usize;
 
-                        let viewport_point =
-                            alacritty_terminal::index::Point::<usize, Column>::new(
-                                line,
-                                Column(col),
-                            );
-                        let term_point =
-                            viewport_to_point(display_offset, viewport_point);
+                            if col >= cols {
+                                col = cols - 1;
+                            }
+                            if line >= lines {
+                                line = lines - 1;
+                            }
 
-                        term.selection = Some(Selection::new(
-                            SelectionType::Simple,
-                            term_point,
-                            Side::Left,
-                        ));
-                    });
+                            let viewport_point =
+                                alacritty_terminal::index::Point::<usize, Column>::new(
+                                    line,
+                                    Column(col),
+                                );
+                            let term_point =
+                                viewport_to_point(display_offset, viewport_point);
 
-                    return EventPropagation::Stop;
+                            term.selection = Some(Selection::new(
+                                SelectionType::Simple,
+                                term_point,
+                                Side::Left,
+                            ));
+                        });
+
+                        return EventPropagation::Stop;
+                    }
                 }
-            }
 
-            EventPropagation::Continue
+                EventPropagation::Continue
+            })
         })
         .on_event(EventListener::PointerMove, move |event| {
-            let Some(session) = session.get_untracked() else {
-                return EventPropagation::Continue;
-            };
-            // Allow selection even if inactive? Yes, why not.
+            logging::measure_ui_event("terminal pointer move", || {
+                let Some(session) = session.get_untracked() else {
+                    return EventPropagation::Continue;
+                };
+                // Allow selection even if inactive? Yes, why not.
 
-            let (cell_width, cell_height) = cell_size.get_untracked();
-            if cell_width <= 0.0 || cell_height <= 0.0 {
-                return EventPropagation::Continue;
-            }
-
-            if let Event::Pointer(UiPointerEvent::Move(update)) = event {
-                if !update.current.buttons.contains(PointerButton::Primary) {
+                let (cell_width, cell_height) = cell_size.get_untracked();
+                if cell_width <= 0.0 || cell_height <= 0.0 {
                     return EventPropagation::Continue;
                 }
 
-                if let Some(pos) = event.point() {
-                    let x = pos.x;
-                    let y = pos.y;
+                if let Event::Pointer(UiPointerEvent::Move(update)) = event {
+                    if !update.current.buttons.contains(PointerButton::Primary) {
+                        return EventPropagation::Continue;
+                    }
 
-                    session.with_term_mut(|term| {
-                        if term.selection.is_none() {
-                            return;
-                        }
+                    if let Some(pos) = event.point() {
+                        let x = pos.x;
+                        let y = pos.y;
 
-                        let (cols, lines, display_offset) = {
-                            let grid = term.grid();
-                            (grid.columns(), grid.screen_lines(), grid.display_offset())
-                        };
+                        session.with_term_mut(|term| {
+                            if term.selection.is_none() {
+                                return;
+                            }
 
-                        if cols == 0 || lines == 0 {
-                            return;
-                        }
+                            let (cols, lines, display_offset) = {
+                                let grid = term.grid();
+                                (grid.columns(), grid.screen_lines(), grid.display_offset())
+                            };
 
-                        let col = (x / cell_width).floor() as isize;
-                        let line = (y / cell_height).floor() as isize;
+                            if cols == 0 || lines == 0 {
+                                return;
+                            }
 
-                        if col < 0 || line < 0 {
-                            return;
-                        }
+                            let col = (x / cell_width).floor() as isize;
+                            let line = (y / cell_height).floor() as isize;
 
-                        let mut col = col as usize;
-                        let mut line = line as usize;
+                            if col < 0 || line < 0 {
+                                return;
+                            }
 
-                        if col >= cols {
-                            col = cols - 1;
-                        }
-                        if line >= lines {
-                            line = lines - 1;
-                        }
+                            let mut col = col as usize;
+                            let mut line = line as usize;
 
-                        let viewport_point =
-                            alacritty_terminal::index::Point::<usize, Column>::new(
-                                line,
-                                Column(col),
-                            );
-                        let term_point =
-                            viewport_to_point(display_offset, viewport_point);
+                            if col >= cols {
+                                col = cols - 1;
+                            }
+                            if line >= lines {
+                                line = lines - 1;
+                            }
 
-                        if let Some(selection) = term.selection.as_mut() {
-                            selection.update(term_point, Side::Right);
-                        }
-                    });
+                            let viewport_point =
+                                alacritty_terminal::index::Point::<usize, Column>::new(
+                                    line,
+                                    Column(col),
+                                );
+                            let term_point =
+                                viewport_to_point(display_offset, viewport_point);
 
-                    return EventPropagation::Stop;
+                            if let Some(selection) = term.selection.as_mut() {
+                                selection.update(term_point, Side::Right);
+                            }
+                        });
+
+                        return EventPropagation::Stop;
+                    }
                 }
-            }
 
-            EventPropagation::Continue
+                EventPropagation::Continue
+            })
         })
         .on_event(EventListener::PointerUp, move |event| {
-            if let Event::Pointer(UiPointerEvent::Up(_)) = event {
-                canvas_id.clear_active();
-            }
-            EventPropagation::Continue
+            logging::measure_ui_event("terminal pointer up", || {
+                if let Event::Pointer(UiPointerEvent::Up(_)) = event {
+                    canvas_id.clear_active();
+                }
+                EventPropagation::Continue
+            })
         });
 
     v_stack((
