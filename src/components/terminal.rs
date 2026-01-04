@@ -25,7 +25,7 @@ use alacritty_terminal::{
 #[cfg(target_os = "macos")]
 use floem::{
     event::{Event, EventListener, EventPropagation},
-    ext_event::{register_ext_trigger, ExtSendTrigger},
+    ext_event::register_ext_trigger,
     peniko::{
         kurbo::Rect,
         Brush, Color,
@@ -41,22 +41,19 @@ use floem::ui_events::pointer::{PointerButton, PointerEvent as UiPointerEvent};
 use std::sync::Arc;
 
 #[cfg(target_os = "macos")]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
 use std::ops::{Index, IndexMut};
 
 /// Base font size for terminal cells.
 #[cfg(target_os = "macos")]
-const TERMINAL_FONT_SIZE: f32 = 12.0;
+const TERMINAL_FONT_SIZE: f32 = 13.0;
 
 #[cfg(target_os = "macos")]
-fn terminal_font_families() -> [FamilyOwned; 4] {
+fn terminal_font_families() -> [FamilyOwned; 1] {
     [
-        FamilyOwned::Name("SF Mono".into()),
         FamilyOwned::Name("Menlo".into()),
-        FamilyOwned::Name("Monaco".into()),
-        FamilyOwned::Monospace,
     ]
 }
 
@@ -303,12 +300,14 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
     let workspace_name = workspace.name.clone();
     let workspace_root = workspace.root.clone();
 
-    let session: RwSignal<Option<Arc<TerminalSession>>> = RwSignal::new(None);
+    let session = workspace.terminal;
     let error_msg: RwSignal<Option<String>> = RwSignal::new(None);
     let last_size: RwSignal<(u16, u16)> = RwSignal::new((0, 0));
     let cell_size: RwSignal<(f64, f64)> = RwSignal::new((0.0, 0.0));
+    let cell_y_offset: RwSignal<f64> = RwSignal::new(0.0);
+    let last_pty_resize_at: RwSignal<Instant> = RwSignal::new(Instant::now());
     // Trigger repaints when terminal content changes (from background thread).
-    let term_update_trigger = ExtSendTrigger::new();
+    let term_update_trigger = workspace.terminal_trigger;
 
     let terminal_canvas = canvas({
         let workspace_root = workspace_root.clone();
@@ -367,33 +366,62 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
                 return;
             };
 
-            // 4. Measure cell size
-            let attrs = Attrs::new()
-                .font_size(TERMINAL_FONT_SIZE)
-                .family(&font_families);
-            let base_attrs_list = AttrsList::new(attrs);
-            let mut metrics_layout = TextLayout::new();
-            metrics_layout.set_text("W", base_attrs_list, None);
-            let metrics_size = metrics_layout.size();
-            let cell_width = metrics_size.width.max(1.0);
-            let cell_height = metrics_size.height.max(1.0);
+            // 4. Measure (and cache) cell size.
+            // Doing this per-frame is expensive and also makes live-resize/fullscreen feel laggy.
+            let (mut cell_width, mut cell_height) = cell_size.get_untracked();
+            if cell_width <= 0.0 || cell_height <= 0.0 {
+                let attrs = Attrs::new()
+                    .font_size(TERMINAL_FONT_SIZE)
+                    .family(&font_families);
+                let base_attrs_list = AttrsList::new(attrs);
+                let mut metrics_layout = TextLayout::new();
+                metrics_layout.set_text("m", base_attrs_list, None);
+                let metrics_size = metrics_layout.size();
+                cell_width = metrics_size.width.max(1.0);
+                // Add vertical breathing room (Ghostty-style line height).
+                cell_height = (metrics_size.height * 1.25).max(1.0);
+                cell_size.set((cell_width, cell_height));
+                cell_y_offset.set((cell_height - metrics_size.height) / 2.0);
+            }
 
-            cell_size.set((cell_width, cell_height));
+            let y_offset = cell_y_offset.get_untracked();
 
             // 5. Resize terminal if needed
-            let cols = (size.width / cell_width).floor().max(1.0) as u16;
-            let rows = (size.height / cell_height).floor().max(1.0) as u16;
+            // Subtract padding (8px on each side = 16px total)
+            let available_width = (size.width - 16.0).max(1.0);
+            let available_height = (size.height - 16.0).max(1.0);
+            let cols = (available_width / cell_width).floor().max(1.0) as u16;
+            let rows = (available_height / cell_height).floor().max(1.0) as u16;
 
             {
                 let (prev_cols, prev_rows) = last_size.get_untracked();
                 if cols != prev_cols || rows != prev_rows {
-                    if let Err(err) = session.resize(cols, rows) {
+                    // Debounce PTY resize during window zoom/fullscreen animations.
+                    // Fullscreen transitions can emit many intermediate sizes; resizing
+                    // the PTY every frame causes huge reflow work and makes the OS
+                    // keep showing a scaled snapshot (blurry) for longer.
+                    let should_resize = if prev_cols == 0 || prev_rows == 0 {
+                        true
+                    } else if cols.abs_diff(prev_cols) >= 12 || rows.abs_diff(prev_rows) >= 6 {
+                        true
+                    } else {
+                        last_pty_resize_at
+                            .get_untracked()
+                            .elapsed()
+                            >= Duration::from_millis(50)
+                    };
+
+                    if !should_resize {
+                        // Keep rendering at the previous grid size until the animation settles.
+                        // The canvas background will cover the rest of the area.
+                    } else if let Err(err) = session.resize(cols, rows) {
                         crate::logging::log_line(
                             "ERROR",
                             &format!("Terminal resize failed: {err}"),
                         );
                     } else {
                         last_size.set((cols, rows));
+                        last_pty_resize_at.set(Instant::now());
                     }
                 }
             }
@@ -407,6 +435,10 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
                 let selection = content.selection;
                 let cursor = content.cursor;
                 let term_colors = content.colors;
+                let default_bg = theme.panel_bg;
+                let mut text = String::with_capacity(8);
+                let mut cell_layout = TextLayout::new();
+                let has_selection = selection.is_some();
 
                 for indexed in content.display_iter.by_ref() {
                     rendered_cells += 1;
@@ -427,6 +459,23 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
 
                     let cell = indexed.cell;
                     let flags = cell.flags;
+                    
+                    // Skip wide char spacer cells - they are just placeholders
+                    if flags.contains(Flags::WIDE_CHAR_SPACER) {
+                        continue;
+                    }
+
+                    // Fast-path: default background + whitespace with no selection.
+                    // This is the common case (especially after a big resize), and
+                    // skipping it avoids per-cell color resolution and text layout.
+                    if !has_selection
+                        && !flags.contains(Flags::INVERSE)
+                        && cell.zerowidth().is_none()
+                        && cell.c.is_whitespace()
+                        && matches!(cell.bg, AnsiColor::Named(NamedColor::Background))
+                    {
+                        continue;
+                    }
 
                     let is_selected = selection.as_ref().map_or(false, |range| {
                         range.contains_cell(
@@ -449,20 +498,29 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
                         std::mem::swap(&mut fg_color, &mut bg_color);
                     }
 
-                    let bg_brush = Brush::from(bg_color);
-                    let cell_rect = Rect::new(x, y, x + cell_width, y + cell_height);
-                    cx.fill(&cell_rect, &bg_brush, 0.0);
+                    // Check if this is a wide character (CJK, emoji, etc.)
+                    let is_wide = flags.contains(Flags::WIDE_CHAR);
+                    let cell_display_width = if is_wide { cell_width * 2.0 } else { cell_width };
 
-                    let mut text = String::new();
+                    // The canvas is already filled with `theme.panel_bg` once per frame.
+                    // Avoid per-cell fills when the background matches the base.
+                    if is_selected || bg_color != default_bg {
+                        let bg_brush = Brush::from(bg_color);
+                        let cell_rect = Rect::new(x, y, x + cell_display_width, y + cell_height);
+                        cx.fill(&cell_rect, &bg_brush, 0.0);
+                    }
+
+                    // Skip text layout/draw for empty cells.
+                    if cell.c.is_whitespace() && cell.zerowidth().is_none() {
+                        continue;
+                    }
+
+                    text.clear();
                     text.push(cell.c);
                     if let Some(extra) = cell.zerowidth() {
                         for ch in extra {
                             text.push(*ch);
                         }
-                    }
-
-                    if text.trim().is_empty() {
-                        continue;
                     }
 
                     let attrs = Attrs::new()
@@ -471,9 +529,16 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
                         .family(&font_families);
                     let attrs_list = AttrsList::new(attrs);
 
-                    let mut cell_layout = TextLayout::new();
                     cell_layout.set_text(&text, attrs_list, None);
-                    cx.draw_text(&cell_layout, floem::kurbo::Point::new(x, y));
+                    
+                    // For wide characters, ensure we don't clip the text
+                    if is_wide {
+                        cx.save();
+                        cx.draw_text(&cell_layout, floem::kurbo::Point::new(x, y + y_offset));
+                        cx.restore();
+                    } else {
+                        cx.draw_text(&cell_layout, floem::kurbo::Point::new(x, y + y_offset));
+                    }
                 }
 
                 // Cursor
@@ -533,6 +598,16 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
 
     let canvas_id = terminal_canvas.id();
 
+    // Wrap canvas to track window_origin
+    let terminal_wrapper = terminal_canvas
+        .on_event_cont(EventListener::WindowGotFocus, move |_| {
+            // Dummy event to trigger update and capture window_origin
+        })
+        .style(|s| s.width_full().height_full());
+
+    // Custom update to track window_origin
+    let terminal_wrapper_id = terminal_wrapper.id();
+    
     // Effect to trigger repaint when session/error state changes
     Effect::new(move |_| {
         session.track();
@@ -541,12 +616,64 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
         canvas_id.request_paint();
     });
 
-    let terminal_canvas = terminal_canvas
+    // Effect to update IME cursor position based on terminal cursor
+    Effect::new(move |_| {
+        cell_size.track();
+        
+        let (cell_width, cell_height) = cell_size.get_untracked();
+        let canvas_rect = terminal_wrapper_id.layout_rect();
+        
+        if cell_width > 0.0 && cell_height > 0.0 && canvas_rect.width() > 0.0 {
+            if let Some(sess) = session.get_untracked() {
+                if sess.is_active() {
+                    sess.with_term(|term| {
+                        let content = term.renderable_content();
+                        let cursor = content.cursor;
+                        let display_offset = content.display_offset;
+                        
+                        if let Some(viewport_cursor) = point_to_viewport(display_offset, cursor.point) {
+                            let col = viewport_cursor.column.0 as f64;
+                            let row = viewport_cursor.line as f64;
+                            
+                            // Calculate cursor position
+                            // Use canvas_rect to get position in window
+                            let x = canvas_rect.x0 + col * cell_width + 8.0;
+                            // Position IME at bottom of cursor cell
+                            let y = canvas_rect.y0 + (row + 1.0) * cell_height + 8.0;
+                            
+                            crate::logging::log_line(
+                                "DEBUG",
+                                &format!("IME: col={} row={} canvas=({:.1},{:.1}) cell=({:.1},{:.1}) final=({:.1},{:.1})", 
+                                    col, row, canvas_rect.x0, canvas_rect.y0, cell_width, cell_height, x, y)
+                            );
+                            
+                            floem::action::set_ime_cursor_area(
+                                floem::kurbo::Point::new(x, y),
+                                floem::kurbo::Size::new(cell_width, cell_height),
+                            );
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    let terminal_wrapper = terminal_wrapper
         .style(move |s| {
             s.width_full()
                 .height_full()
                 .background(theme.panel_bg)
                 .focusable(true)
+        })
+        .on_event(EventListener::FocusGained, move |_| {
+            logging::breadcrumb("terminal focus gained".to_string());
+            floem::action::set_ime_allowed(true);
+            EventPropagation::Continue
+        })
+        .on_event(EventListener::FocusLost, move |_| {
+            logging::breadcrumb("terminal focus lost".to_string());
+            floem::action::set_ime_allowed(false);
+            EventPropagation::Continue
         })
         .on_event(EventListener::KeyDown, move |event| {
             logging::measure_ui_event("terminal keydown", || {
@@ -564,9 +691,6 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
                                 "terminal keydown: char len={}",
                                 text.len()
                             ));
-                        }
-                        _ => {
-                            logging::breadcrumb("terminal keydown".to_string());
                         }
                     }
 
@@ -700,6 +824,33 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
                 } else {
                     EventPropagation::Continue
                 }
+            })
+        })
+        .on_event(EventListener::ImeCommit, move |event| {
+            logging::measure_ui_event("terminal ime commit", || {
+                if let Event::ImeCommit(text) = event {
+                    logging::breadcrumb(format!("terminal ime commit: len={}", text.len()));
+                    
+                    let Some(session) = session.get_untracked() else {
+                        return EventPropagation::Continue;
+                    };
+                    
+                    if !session.is_active() {
+                        return EventPropagation::Stop;
+                    }
+                    
+                    if !text.is_empty() {
+                        if let Err(err) = session.write(text.as_bytes()) {
+                            crate::logging::log_line(
+                                "ERROR",
+                                &format!("Terminal IME write failed: {err}"),
+                            );
+                        }
+                    }
+                    
+                    return EventPropagation::Stop;
+                }
+                EventPropagation::Continue
             })
         })
         .on_event(EventListener::PointerWheel, move |event| {
@@ -888,7 +1039,7 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
                 .color(theme.text_muted)
         }),
         meta_text(format!("Workspace: {workspace_name}"), theme),
-        Container::new(terminal_canvas).style(move |s| {
+        Container::new(terminal_wrapper).style(move |s| {
             s.width_full()
                 .height_full()
                 .padding(8.0)

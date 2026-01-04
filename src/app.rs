@@ -378,5 +378,7 @@ fn build_tab(id: usize, root: PathBuf) -> WorkspaceTab {
         root,
         file_tree,
         git_status,
+        terminal: RwSignal::new(None),
+        terminal_trigger: ExtSendTrigger::new(),
     }
 }

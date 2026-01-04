@@ -1,4 +1,8 @@
+use crate::services::TerminalSession;
+use floem::ext_event::ExtSendTrigger;
+use floem::reactive::RwSignal;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct WorkspaceTab {
@@ -7,6 +11,8 @@ pub struct WorkspaceTab {
     pub root: PathBuf,
     pub file_tree: Vec<TreeEntry>,
     pub git_status: Vec<String>,
+    pub terminal: RwSignal<Option<Arc<TerminalSession>>>,
+    pub terminal_trigger: ExtSendTrigger,
 }
 
 #[derive(Clone)]

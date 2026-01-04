@@ -1,4 +1,5 @@
 use crate::theme::{HEADER_FONT_SIZE, HEADER_HEIGHT, LIST_FONT_SIZE, LIST_HEIGHT, UiTheme};
+use floem::event::{EventListener, EventPropagation};
 use floem::prelude::*;
 use floem::style::CursorStyle;
 use floem::views::svg;
@@ -43,15 +44,17 @@ pub fn panel_header(title: String, icon_svg: &'static str, theme: UiTheme) -> im
 }
 
 pub fn list_item<V: IntoView + 'static>(content: V, indent: f32, theme: UiTheme) -> impl IntoView {
-    Container::new(content).style(move |s| {
-        s.width_full()
-            .height(LIST_HEIGHT)
-            .flex_row()
-            .items_center()
-            .padding_left(indent)
-            .padding_right(8.0)
-            .hover(|s| s.background(theme.element_bg))
-    })
+    Container::new(content)
+        .on_event(EventListener::PointerDown, |_| EventPropagation::Stop)
+        .style(move |s| {
+            s.width_full()
+                .height(LIST_HEIGHT)
+                .flex_row()
+                .items_center()
+                .padding_left(indent)
+                .padding_right(8.0)
+                .hover(|s| s.background(theme.element_bg))
+        })
 }
 
 pub fn list_label(text: String, theme: UiTheme, strong: bool) -> impl IntoView {

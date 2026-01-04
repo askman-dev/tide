@@ -24,6 +24,7 @@ static LAST_RENDER_CELLS: OnceLock<AtomicU64> = OnceLock::new();
 static LAST_RENDER_COLS: OnceLock<AtomicU64> = OnceLock::new();
 static LAST_RENDER_ROWS: OnceLock<AtomicU64> = OnceLock::new();
 static UI_THREAD_LABEL: OnceLock<String> = OnceLock::new();
+static LAST_FLUSH_AT_MS: OnceLock<AtomicU64> = OnceLock::new();
 
 pub fn init() {
     let current = std::thread::current();
@@ -80,7 +81,27 @@ pub fn log_line(level: &str, message: &str) {
                 let _ = writeln!(file, "[{ts}] [{thread}] [{level}] {line}");
             }
         }
-        let _ = file.flush();
+        // Flushing every log line is a big performance hit (especially in render loops),
+        // but we still want crash/hang diagnostics to hit disk quickly.
+        let should_flush = match level {
+            "WARN" | "ERROR" | "PANIC" => true,
+            _ => {
+                let now = now_millis();
+                let last = LAST_FLUSH_AT_MS
+                    .get_or_init(|| AtomicU64::new(now))
+                    .load(Ordering::Relaxed);
+                let due = now.saturating_sub(last) >= 250;
+                if due {
+                    LAST_FLUSH_AT_MS
+                        .get_or_init(|| AtomicU64::new(now))
+                        .store(now, Ordering::Relaxed);
+                }
+                due
+            }
+        };
+        if should_flush {
+            let _ = file.flush();
+        }
     }
 }
 

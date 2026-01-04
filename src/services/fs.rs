@@ -34,9 +34,20 @@ pub fn list_dir_entries(root: &Path, depth: usize) -> Vec<TreeEntry> {
         })
         .collect::<Vec<_>>();
 
+    let elapsed = start.elapsed();
+    logging::log_line(
+        "INFO",
+        &format!(
+            "dir list: root={} depth={} entries={} ms={}",
+            root.display(),
+            depth,
+            entries.len(),
+            elapsed.as_millis()
+        ),
+    );
     logging::log_slow_op(
         "list_dir_entries",
-        start.elapsed(),
+        elapsed,
         &format!("root={} depth={depth}", root.display()),
     );
 
