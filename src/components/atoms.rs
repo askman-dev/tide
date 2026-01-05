@@ -28,7 +28,7 @@ pub fn panel_header(title: String, icon_svg: &'static str, theme: UiTheme) -> im
     let header_text = spaced_uppercase(&title);
     h_stack((
         icon_soft(icon_svg, theme),
-        Label::new(header_text).style(move |s| {
+        label(move || header_text.clone()).style(move |s| {
             s.font_size(HEADER_FONT_SIZE)
                 .font_bold()
                 .color(theme.text_muted)
@@ -44,7 +44,7 @@ pub fn panel_header(title: String, icon_svg: &'static str, theme: UiTheme) -> im
 }
 
 pub fn list_item<V: IntoView + 'static>(content: V, indent: f32, theme: UiTheme) -> impl IntoView {
-    Container::new(content)
+    container(content)
         .on_event(EventListener::PointerDown, |_| EventPropagation::Stop)
         .style(move |s| {
             s.width_full()
@@ -58,7 +58,7 @@ pub fn list_item<V: IntoView + 'static>(content: V, indent: f32, theme: UiTheme)
 }
 
 pub fn list_label(text: String, theme: UiTheme, strong: bool) -> impl IntoView {
-    Label::new(text).style(move |s| {
+    label(move || text.clone()).style(move |s| {
         let mut s = s
             .font_size(LIST_FONT_SIZE)
             .color(if strong { theme.text } else { theme.text_muted });
@@ -70,7 +70,7 @@ pub fn list_label(text: String, theme: UiTheme, strong: bool) -> impl IntoView {
 }
 
 pub fn splitter(theme: UiTheme) -> impl IntoView {
-    Container::new(Empty::new()).style(move |s| {
+    container(empty()).style(move |s| {
         s.width(1.0)
             .height_full()
             .background(theme.border_subtle)
@@ -105,7 +105,7 @@ pub fn tab_button(
 }
 
 pub fn meta_text(text: String, theme: UiTheme) -> impl IntoView {
-    Label::new(text).style(move |s| {
+    label(move || text.clone()).style(move |s| {
         s.font_size(11.0)
             .color(theme.text_soft)
             .height(18.0)

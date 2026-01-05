@@ -1,14 +1,17 @@
 use crate::theme::UiTheme;
 use crate::logging;
+use crate::components::terminal::direct_terminal_resize;
 use floem::context::EventCx;
 use floem::event::{Event, EventPropagation};
+use floem::WindowIdExt;
 use floem::prelude::*;
 use floem::style::CursorStyle;
 use floem::style::Style;
 use floem::views::drag_window_area;
 use floem::views::Empty;
 use floem::ViewId;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const LEFT_MIN_WIDTH: f64 = 200.0;
 const CENTER_MIN_WIDTH: f64 = 300.0;
@@ -16,6 +19,70 @@ const CENTER_MIN_WIDTH: f64 = 300.0;
 // which caused the layout engine to overflow and our splitter hit-testing to miss in windowed mode.
 const RIGHT_MIN_WIDTH: f64 = 260.0;
 const HANDLE_WIDTH: f64 = 10.0;
+
+/// Animation detection: track when resize burst started.
+/// We use a fixed 1.2s timer from first event, because WindowResized events themselves
+/// are delayed by macOS during zoom animation (real animation is ~1s, but events arrive over 3s).
+static ANIMATION_TIMER_ACTIVE: AtomicBool = AtomicBool::new(false);
+static RESIZE_BURST_START_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Last known window size - updated by WindowResized events.
+/// Terminal can read this to get the latest size without waiting for canvas paint.
+static LAST_WINDOW_WIDTH: AtomicU64 = AtomicU64::new(0);
+static LAST_WINDOW_HEIGHT: AtomicU64 = AtomicU64::new(0);
+
+/// Get the last known window size.
+pub fn get_last_window_size() -> (f64, f64) {
+    let w = f64::from_bits(LAST_WINDOW_WIDTH.load(Ordering::SeqCst));
+    let h = f64::from_bits(LAST_WINDOW_HEIGHT.load(Ordering::SeqCst));
+    (w, h)
+}
+
+fn current_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Start a fixed-delay timer that directly resizes terminal 1.2s after resize starts.
+/// Executes resize directly on background thread (PTY resize is thread-safe).
+/// Key insight: macOS visual animation is ~1s, but WindowResized events are delayed ~2s.
+fn start_animation_timer() {
+    let now = current_time_ms();
+    let burst_start = RESIZE_BURST_START_MS.load(Ordering::SeqCst);
+
+    // If this is a new resize burst (>500ms since last burst started), start new timer
+    let is_new_burst = now.saturating_sub(burst_start) > 500;
+
+    if is_new_burst {
+        RESIZE_BURST_START_MS.store(now, Ordering::SeqCst);
+
+        // Only start one timer per burst
+        if ANIMATION_TIMER_ACTIVE.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
+        std::thread::spawn(move || {
+            // Wait 1.2s from burst start - this is when real animation should be done
+            std::thread::sleep(Duration::from_millis(1200));
+
+            // Get window size from our atomic storage
+            let (window_w, window_h) = get_last_window_size();
+
+            logging::log_line("DEBUG", &format!(
+                "animation timer: 1.2s elapsed, executing resize directly for {:.0}x{:.0}",
+                window_w, window_h
+            ));
+
+            // Execute resize directly on this background thread
+            // PTY resize and term.lock() are thread-safe
+            direct_terminal_resize(window_w, window_h);
+
+            ANIMATION_TIMER_ACTIVE.store(false, Ordering::SeqCst);
+        });
+    }
+}
 
 #[derive(Clone, Copy)]
 enum SplitHandle {
@@ -122,38 +189,87 @@ impl View for SplitDragCapture {
     fn event_before_children(&mut self, _cx: &mut EventCx, event: &Event) -> EventPropagation {
         match event {
             Event::WindowResized(size) => {
-                // Debounce clamp_widths during animations to avoid blocking UI thread.
-                // Only clamp when animation settles or at reasonable intervals.
+                let event_start = Instant::now();
+                logging::breadcrumb(format!(
+                    "WindowResized event: {:.0}x{:.0}",
+                    size.width, size.height
+                ));
+
+                // Update last known window size
+                LAST_WINDOW_WIDTH.store(size.width.to_bits(), Ordering::SeqCst);
+                LAST_WINDOW_HEIGHT.store(size.height.to_bits(), Ordering::SeqCst);
+
+                // Start animation timer if this is a new resize burst
+                start_animation_timer();
+
+                // Check if we're in animation burst mode
+                let now = current_time_ms();
+                let burst_start = RESIZE_BURST_START_MS.load(Ordering::SeqCst);
+                let in_animation_burst = now.saturating_sub(burst_start) < 1500; // Within 1.5s of burst start
+
+                // During animation burst, SKIP expensive operations to let event queue drain faster
+                // The animation timer will handle resize after burst settles
+                if in_animation_burst {
+                    // Minimal processing - just update size tracking
+                    let total_ms = event_start.elapsed().as_micros() as f64 / 1000.0;
+                    if self.last_resize_log_at.elapsed() >= Duration::from_millis(200) {
+                        self.last_resize_log_at = Instant::now();
+                        logging::log_line(
+                            "DEBUG",
+                            &format!(
+                                "WindowResized {:.0}x{:.0}: SKIPPED (animation burst) total={:.2}ms",
+                                size.width, size.height, total_ms
+                            ),
+                        );
+                    }
+                    return EventPropagation::Continue;
+                }
+
+                // Not in animation burst - do full processing
                 let should_clamp = self.last_clamp_at.elapsed() >= Duration::from_millis(100);
-                
+
                 if should_clamp {
+                    let clamp_start = Instant::now();
                     self.clamp_widths();
                     self.last_clamp_at = Instant::now();
+                    let clamp_ms = clamp_start.elapsed().as_micros() as f64 / 1000.0;
+                    if clamp_ms > 1.0 {
+                        logging::log_line("DEBUG", &format!("clamp_widths took {clamp_ms:.2}ms"));
+                    }
                 }
-                
-                // Force immediate layout and repaint to avoid macOS showing stale scaled screenshots
+
+                // Force immediate layout and repaint
+                let layout_start = Instant::now();
                 self.id.request_layout();
-                
-                // Log less frequently to avoid spam
-                if self.last_resize_log_at.elapsed() >= Duration::from_millis(500) {
+                let layout_ms = layout_start.elapsed().as_micros() as f64 / 1000.0;
+
+                let paint_start = Instant::now();
+                self.id.request_paint();
+                let paint_ms = paint_start.elapsed().as_micros() as f64 / 1000.0;
+
+                let repaint_start = Instant::now();
+                if let Some(window_id) = self.id.window_id() {
+                    let _ = window_id.force_repaint();
+                }
+                let repaint_ms = repaint_start.elapsed().as_micros() as f64 / 1000.0;
+
+                let total_ms = event_start.elapsed().as_micros() as f64 / 1000.0;
+
+                // Log timing for resize events
+                if self.last_resize_log_at.elapsed() >= Duration::from_millis(200) || total_ms > 5.0 {
                     self.last_resize_log_at = Instant::now();
                     logging::log_line(
-                        "INFO",
+                        "DEBUG",
                         &format!(
-                            "window resized: {:.0}x{:.0} left={:.0} right={:.0}",
-                            size.width,
-                            size.height,
-                            self.left_width.get_untracked(),
-                            self.right_width.get_untracked()
+                            "WindowResized {:.0}x{:.0}: total={:.2}ms (layout={:.2}ms paint={:.2}ms repaint={:.2}ms)",
+                            size.width, size.height, total_ms, layout_ms, paint_ms, repaint_ms
                         ),
                     );
                 }
                 EventPropagation::Continue
             }
-            Event::Pointer(PointerEvent::Down(button_event)) => {
-                let Some(pos) = event.point() else {
-                    return EventPropagation::Continue;
-                };
+            Event::PointerDown(pointer_event) => {
+                let pos = pointer_event.pos;
 
                 // Only start drag when the pointer is over a handle.
                 let Some(handle) = self.handle_hit_test(pos.x) else {
@@ -162,7 +278,6 @@ impl View for SplitDragCapture {
 
                 logging::breadcrumb(format!("split drag start: {pos:?}"));
 
-                self.id.request_active();
                 self.drag = Some(DragState {
                     handle,
                     start_x: pos.x,
@@ -170,18 +285,14 @@ impl View for SplitDragCapture {
                     start_right: self.right_width.get_untracked(),
                 });
 
-                // Prevent child views from interpreting this as a click.
-                let _ = button_event;
                 EventPropagation::Stop
             }
-            Event::Pointer(PointerEvent::Move(_)) => {
+            Event::PointerMove(pointer_event) => {
                 let Some(drag) = self.drag else {
                     return EventPropagation::Continue;
                 };
 
-                let Some(pos) = event.point() else {
-                    return EventPropagation::Continue;
-                };
+                let pos = pointer_event.pos;
 
                 let total_width = self.total_width();
                 let delta = pos.x - drag.start_x;
@@ -210,11 +321,10 @@ impl View for SplitDragCapture {
                 self.id.request_layout();
                 EventPropagation::Stop
             }
-            Event::Pointer(PointerEvent::Up(_)) => {
+            Event::PointerUp(_) => {
                 if self.drag.is_some() {
                     logging::breadcrumb("split drag end".to_string());
                     self.drag = None;
-                    self.id.clear_active();
                     return EventPropagation::Stop;
                 }
                 EventPropagation::Continue
@@ -231,9 +341,10 @@ pub fn tab_bar<T: IntoView + 'static, A: IntoView + 'static>(
 ) -> impl IntoView {
     let left_padding = if cfg!(target_os = "macos") { 72.0 } else { 8.0 };
     let tabs = tabs.into_view().style(|s| s.flex_row().col_gap(6.0));
+
     h_stack((
         tabs,
-        drag_window_area(Empty::new())
+        drag_window_area(empty())
             .style(|s| s.flex_grow(1.0).height_full()),
         actions.into_view(),
     ))
@@ -250,7 +361,7 @@ pub fn tab_bar<T: IntoView + 'static, A: IntoView + 'static>(
 }
 
 pub fn app_shell<V: IntoView + 'static>(body: V, theme: UiTheme) -> impl IntoView {
-    Container::new(body).style(move |s| {
+    container(body).style(move |s| {
         s.size_full()
             .items_stretch()
             .background(theme.surface)
@@ -269,19 +380,19 @@ pub fn main_layout<L: IntoView + 'static, C: IntoView + 'static, R: IntoView + '
     let left_width = RwSignal::new(LEFT_MIN_WIDTH);
     let right_width = RwSignal::new(RIGHT_MIN_WIDTH);
 
-    let left = Container::new(left).style(move |s| {
+    let left = container(left).style(move |s| {
         s.width(left_width.get())
             .min_width(LEFT_MIN_WIDTH)
             .height_full()
             .background(theme.panel_bg)
     });
-    let center = Container::new(center).style(move |s| {
+    let center = container(center).style(move |s| {
         s.flex_grow(1.0)
             .min_width(CENTER_MIN_WIDTH)
             .height_full()
             .background(theme.surface)
     });
-    let right = Container::new(right).style(move |s| {
+    let right = container(right).style(move |s| {
         s.width(right_width.get())
             .min_width(RIGHT_MIN_WIDTH)
             .height_full()
@@ -289,7 +400,7 @@ pub fn main_layout<L: IntoView + 'static, C: IntoView + 'static, R: IntoView + '
     });
 
     let make_handle = move || {
-        Container::new(Empty::new()).style(move |s| {
+        container(empty()).style(move |s| {
             s.width(HANDLE_WIDTH)
                 .height_full()
                 .flex_shrink(0.0)
@@ -307,7 +418,7 @@ pub fn main_layout<L: IntoView + 'static, C: IntoView + 'static, R: IntoView + '
 }
 
 pub fn right_sidebar<V: IntoView + 'static>(content: V, theme: UiTheme) -> impl IntoView {
-    Container::new(content).style(move |s| {
+    container(content).style(move |s| {
         s.width(260.0)
             .height_full()
             .items_stretch()
@@ -324,7 +435,7 @@ pub fn sidebar_stack<V: ViewTuple + 'static>(content: V, theme: UiTheme) -> impl
 }
 
 pub fn main_work<V: IntoView + 'static>(content: V, theme: UiTheme) -> impl IntoView {
-    Container::new(content).style(move |s| {
+    container(content).style(move |s| {
         s.flex_grow(2.0)
             .height_full()
             .padding(8.0)
@@ -333,7 +444,7 @@ pub fn main_work<V: IntoView + 'static>(content: V, theme: UiTheme) -> impl Into
 }
 
 pub fn center_preview<V: IntoView + 'static>(content: V, theme: UiTheme) -> impl IntoView {
-    Container::new(content).style(move |s| {
+    container(content).style(move |s| {
         s.flex_grow(0.0)
             .height_full()
             .width(0.0)

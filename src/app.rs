@@ -7,7 +7,7 @@ use crate::services::{build_tree_entries, git_status_entries};
 use crate::theme::UiTheme;
 use floem::ext_event::{register_ext_trigger, ExtSendTrigger};
 use floem::prelude::*;
-use floem::reactive::Effect;
+use floem::reactive::create_effect;
 use crate::logging;
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -36,7 +36,7 @@ pub fn app_view() -> impl IntoView {
                 move || active_tab.get() == tab_id,
                 theme,
                 move || {
-                    logging::breadcrumb(format!("tab select: id={tab_id}"));
+                    // logging::breadcrumb(format!("tab select: id={tab_id}"));
                     active_tab.set(tab_id);
                 },
             )
@@ -74,7 +74,7 @@ pub fn app_view() -> impl IntoView {
         let tab = tabs_vec.into_iter().find(|tab| tab.id == tab_id);
         match tab {
             Some(tab) => workspace_view(tab, theme).into_any(),
-            None => Label::new("No workspace").into_any(),
+            None => label(|| "No workspace").into_any(),
         }
     })
     .style(|s| s.size_full().flex_grow(1.0).items_stretch());
@@ -94,7 +94,7 @@ fn install_ui_watchdog() {
     const STALE_AFTER: Duration = Duration::from_secs(2);
 
     let heartbeat_trigger = ExtSendTrigger::new();
-    Effect::new(move |_| {
+    create_effect(move |_| {
         heartbeat_trigger.track();
         logging::touch_heartbeat();
     });
@@ -165,8 +165,8 @@ fn workspace_view(tab: WorkspaceTab, theme: UiTheme) -> impl IntoView {
 
 fn project_header_view(name: String, path: String, theme: UiTheme) -> impl IntoView {
     v_stack((
-        Label::new(name).style(move |s| s.font_size(13.0).font_bold().color(theme.text)),
-        Label::new(path).style(move |s| {
+        label(move || name.clone()).style(move |s| s.font_size(13.0).font_bold().color(theme.text)),
+        label(move || path.clone()).style(move |s| {
             s.font_size(11.0)
                 .color(theme.text_soft)
                 .text_ellipsis()
@@ -193,7 +193,8 @@ fn history_view(theme: UiTheme) -> impl IntoView {
 }
 
 fn history_item(text: &str, theme: UiTheme) -> impl IntoView {
-    Container::new(Label::new(text.to_string()).style(move |s| {
+    let text = text.to_string();
+    container(label(move || text.clone()).style(move |s| {
         s.font_size(12.0)
             .color(theme.text_muted)
             .text_ellipsis()
@@ -233,12 +234,14 @@ fn chat_thread_view(theme: UiTheme) -> impl IntoView {
 }
 
 fn chat_card_view(title: &str, body: &str, is_primary: bool, theme: UiTheme) -> impl IntoView {
-    let header = Label::new(title.to_string()).style(move |s| {
+    let title = title.to_string();
+    let body = body.to_string();
+    let header = label(move || title.clone()).style(move |s| {
         s.font_size(11.0)
             .color(theme.text_soft)
             .text_ellipsis()
     });
-    let message = Label::new(body.to_string()).style(move |s| {
+    let message = label(move || body.clone()).style(move |s| {
         s.font_size(12.0)
             .color(theme.text)
             .text_ellipsis()
@@ -250,7 +253,7 @@ fn chat_card_view(title: &str, body: &str, is_primary: bool, theme: UiTheme) -> 
         theme.panel_bg
     };
 
-    Container::new(v_stack((header, message)).style(|s| s.row_gap(6.0)))
+    container(v_stack((header, message)).style(|s| s.row_gap(6.0)))
         .style(move |s| {
             s.width_full()
                 .padding(12.0)
@@ -262,7 +265,7 @@ fn chat_card_view(title: &str, body: &str, is_primary: bool, theme: UiTheme) -> 
 }
 
 fn chat_input_view(theme: UiTheme) -> impl IntoView {
-    Container::new(Label::new("Ask Tide".to_string()).style(move |s| {
+    container(label(|| "Ask Tide").style(move |s| {
         s.font_size(12.0).color(theme.text_soft)
     }))
     .style(move |s| {
@@ -299,8 +302,9 @@ fn context_menu_view(theme: UiTheme) -> impl IntoView {
     })
 }
 
-fn menu_item_view(label: &str, theme: UiTheme) -> impl IntoView {
-    Container::new(Label::new(label.to_string()).style(move |s| {
+fn menu_item_view(label_text: &str, theme: UiTheme) -> impl IntoView {
+    let label_text = label_text.to_string();
+    container(label(move || label_text.clone()).style(move |s| {
         s.font_size(12.0).color(theme.text)
     }))
     .style(move |s| {
@@ -328,8 +332,8 @@ fn editor_workspace_view(theme: UiTheme) -> impl IntoView {
             .background(theme.panel_bg)
     });
 
-    let editor_body = Container::new(Label::new(
-        "Editor placeholder (code, web previews, or docs appear here).",
+    let editor_body = container(label(||
+        "Editor placeholder (code, web previews, or docs appear here)."
     ))
     .style(move |s| {
         s.flex_grow(1.0)
@@ -343,13 +347,14 @@ fn editor_workspace_view(theme: UiTheme) -> impl IntoView {
     v_stack((tabs, editor_body)).style(|s| s.size_full())
 }
 
-fn editor_tab_view(label: &str, is_active: bool, theme: UiTheme) -> impl IntoView {
+fn editor_tab_view(label_text: &str, is_active: bool, theme: UiTheme) -> impl IntoView {
+    let label_text = label_text.to_string();
     let background = if is_active {
         theme.element_bg
     } else {
         theme.panel_bg
     };
-    Container::new(Label::new(label.to_string()).style(move |s| {
+    container(label(move || label_text.clone()).style(move |s| {
         s.font_size(12.0)
             .color(if is_active { theme.text } else { theme.text_muted })
             .text_ellipsis()

@@ -315,6 +315,10 @@ mod platform {
         pub fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
             let dims = TermDimensions::new(cols, rows);
 
+            logging::breadcrumb(format!("TerminalSession::resize begin {cols}x{rows}"));
+            let resize_start = Instant::now();
+
+            let pty_start = Instant::now();
             self.pty_master
                 .resize(PtySize {
                     rows,
@@ -323,11 +327,34 @@ mod platform {
                     pixel_height: 0,
                 })
                 .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+            let pty_elapsed = pty_start.elapsed();
+            logging::log_slow_op("pty resize", pty_elapsed, &format!("grid={cols}x{rows}"));
 
             {
+                let lock_start = Instant::now();
                 let mut term = self.term.lock();
+                logging::log_slow_op(
+                    "term lock",
+                    lock_start.elapsed(),
+                    &format!("grid={cols}x{rows}"),
+                );
+
+                let term_start = Instant::now();
                 term.resize(dims);
+                let term_elapsed = term_start.elapsed();
+                logging::log_slow_op("term resize", term_elapsed, &format!("grid={cols}x{rows}"));
             }
+
+            let total = resize_start.elapsed();
+            logging::log_slow_op("terminal resize", total, &format!("grid={cols}x{rows}"));
+            logging::log_line(
+                "INFO",
+                &format!(
+                    "TerminalSession::resize end {cols}x{rows} total={}ms pty={}ms",
+                    total.as_millis(),
+                    pty_elapsed.as_millis(),
+                ),
+            );
 
             Ok(())
         }

@@ -6,7 +6,7 @@ use crate::services::list_dir_entries;
 use crate::theme::{TREE_INDENT, UiTheme};
 use floem::ext_event::{register_ext_trigger, ExtSendTrigger};
 use floem::prelude::*;
-use floem::reactive::Effect;
+use floem::reactive::create_effect;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -19,7 +19,7 @@ pub fn panel_view<V: IntoView + 'static>(
     let header_title = title.to_string();
     v_stack((
         panel_header(header_title, icon_svg, theme),
-        Container::new(body).style(move |s| {
+        container(body).style(move |s| {
             s.size_full()
                 .flex_grow(1.0)
                 .items_stretch()
@@ -38,7 +38,7 @@ pub fn file_tree_view(entries: Vec<TreeEntry>, theme: UiTheme) -> impl IntoView 
     {
         let pending_toggle = Arc::clone(&pending_toggle);
         let entries = entries;
-        Effect::new(move |_| {
+        create_effect(move |_| {
             toggle_trigger.track();
             if let Ok(mut pending) = pending_toggle.lock() {
                 if let Some(start) = pending.take() {
@@ -79,7 +79,7 @@ pub fn file_tree_view(entries: Vec<TreeEntry>, theme: UiTheme) -> impl IntoView 
             let icon_svg = if is_dir { FOLDER } else { FILE };
             let row = h_stack((
                 if chevron.is_empty() {
-                    Empty::new().style(|s| s.width(12.0).height(12.0)).into_any()
+                    empty().style(|s| s.width(12.0).height(12.0)).into_any()
                 } else {
                     icon(chevron, theme).into_any()
                 },

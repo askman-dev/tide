@@ -25,26 +25,161 @@ use alacritty_terminal::{
 #[cfg(target_os = "macos")]
 use floem::{
     event::{Event, EventListener, EventPropagation},
-    ext_event::register_ext_trigger,
+    ext_event::{register_ext_trigger, ExtSendTrigger},
+    keyboard::{Key, NamedKey},
     peniko::{
         kurbo::Rect,
         Brush, Color,
     },
-    reactive::{Effect, RwSignal},
+    pointer::{PointerInputEvent, PointerMoveEvent, PointerButton, MouseButton},
+    reactive::{create_effect, RwSignal},
     text::{Attrs, AttrsList, FamilyOwned, TextLayout},
 };
-
-#[cfg(target_os = "macos")]
-use floem::ui_events::pointer::{PointerButton, PointerEvent as UiPointerEvent};
 
 #[cfg(target_os = "macos")]
 use std::sync::Arc;
 
 #[cfg(target_os = "macos")]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
 use std::ops::{Index, IndexMut};
+
+#[cfg(target_os = "macos")]
+use std::sync::{Mutex, OnceLock};
+
+/// Global trigger for forcing terminal repaint from WindowResized events.
+/// This allows layout.rs to bypass the normal canvas paint flow during macOS animations.
+#[cfg(target_os = "macos")]
+static FORCE_REPAINT_TRIGGER: OnceLock<Mutex<Option<ExtSendTrigger>>> = OnceLock::new();
+
+/// Wrapper to make Weak<TerminalSession> Sync.
+/// Safety: Only accessed from main thread via GCD dispatch, and we only hold a Weak reference.
+#[cfg(target_os = "macos")]
+struct SendSyncSession(Option<std::sync::Weak<TerminalSession>>);
+
+#[cfg(target_os = "macos")]
+unsafe impl Send for SendSyncSession {}
+#[cfg(target_os = "macos")]
+unsafe impl Sync for SendSyncSession {}
+
+/// Global terminal session reference for direct resize from animation timer.
+/// This bypasses the floem event queue by allowing layout.rs to directly call resize.
+#[cfg(target_os = "macos")]
+static GLOBAL_TERMINAL_SESSION: OnceLock<Mutex<SendSyncSession>> = OnceLock::new();
+
+/// Global cached cell size for calculating grid dimensions without canvas access.
+#[cfg(target_os = "macos")]
+static CACHED_CELL_WIDTH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(target_os = "macos")]
+static CACHED_CELL_HEIGHT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Register a trigger that can be used to force terminal repaint from external code.
+#[cfg(target_os = "macos")]
+pub fn register_force_repaint_trigger(trigger: ExtSendTrigger) {
+    let mutex = FORCE_REPAINT_TRIGGER.get_or_init(|| Mutex::new(None));
+    if let Ok(mut guard) = mutex.lock() {
+        *guard = Some(trigger);
+    }
+}
+
+/// Register the terminal session globally for direct resize access.
+#[cfg(target_os = "macos")]
+pub fn register_terminal_session(session: &Arc<TerminalSession>) {
+    let mutex = GLOBAL_TERMINAL_SESSION.get_or_init(|| Mutex::new(SendSyncSession(None)));
+    if let Ok(mut guard) = mutex.lock() {
+        guard.0 = Some(Arc::downgrade(session));
+    }
+}
+
+/// Update the cached cell size for grid calculations.
+#[cfg(target_os = "macos")]
+pub fn update_cached_cell_size(width: f64, height: f64) {
+    use std::sync::atomic::Ordering;
+    CACHED_CELL_WIDTH.store(width.to_bits(), Ordering::SeqCst);
+    CACHED_CELL_HEIGHT.store(height.to_bits(), Ordering::SeqCst);
+}
+
+/// Get the cached cell size.
+#[cfg(target_os = "macos")]
+pub fn get_cached_cell_size() -> (f64, f64) {
+    use std::sync::atomic::Ordering;
+    let w = f64::from_bits(CACHED_CELL_WIDTH.load(Ordering::SeqCst));
+    let h = f64::from_bits(CACHED_CELL_HEIGHT.load(Ordering::SeqCst));
+    (w, h)
+}
+
+/// Force a terminal repaint by triggering the registered ExtSendTrigger.
+/// Called from layout.rs when animation is likely to have ended.
+#[cfg(target_os = "macos")]
+pub fn force_terminal_repaint() {
+    if let Some(mutex) = FORCE_REPAINT_TRIGGER.get() {
+        if let Ok(guard) = mutex.lock() {
+            if let Some(ref trigger) = *guard {
+                let t: ExtSendTrigger = trigger.clone();
+                register_ext_trigger(t);
+                logging::log_line("DEBUG", "force_terminal_repaint: triggered from animation timer");
+            }
+        }
+    }
+}
+
+/// Directly resize the terminal PTY, bypassing floem's event queue.
+/// Called from layout.rs animation timer via GCD dispatch.
+#[cfg(target_os = "macos")]
+pub fn direct_terminal_resize(window_width: f64, window_height: f64) {
+    let (cell_width, cell_height) = get_cached_cell_size();
+
+    if cell_width <= 0.0 || cell_height <= 0.0 {
+        logging::log_line("DEBUG", "direct_terminal_resize: no cached cell size yet");
+        // Fall back to triggering repaint
+        force_terminal_repaint();
+        return;
+    }
+
+    // Get the terminal session
+    let session_opt = GLOBAL_TERMINAL_SESSION.get().and_then(|mutex| {
+        mutex.lock().ok().and_then(|guard| {
+            guard.0.as_ref().and_then(|weak| weak.upgrade())
+        })
+    });
+
+    let Some(session) = session_opt else {
+        logging::log_line("DEBUG", "direct_terminal_resize: no session registered");
+        force_terminal_repaint();
+        return;
+    };
+
+    // Calculate grid size using the same logic as canvas paint
+    // Account for padding (8px on each side = 16px total) and layout overhead
+    // The terminal canvas is inside a Container with padding, and the center pane has flex layout
+    // We need to estimate the terminal canvas size from window size
+    // Left pane (200) + handle (10) + right pane (260) + handle (10) = 480
+    // Plus some padding = ~500px of non-terminal width
+    let terminal_canvas_width = (window_width - 500.0).max(300.0);
+    let terminal_canvas_height = (window_height - 80.0).max(200.0); // Tab bar + padding
+
+    let available_width = (terminal_canvas_width - 16.0).max(1.0);
+    let available_height = (terminal_canvas_height - 16.0).max(1.0);
+    let cols = (available_width / cell_width).floor().max(1.0) as u16;
+    let rows = (available_height / cell_height).floor().max(1.0) as u16;
+
+    logging::log_line(
+        "DEBUG",
+        &format!(
+            "direct_terminal_resize: window={:.0}x{:.0} canvas_est={:.0}x{:.0} cell={:.1}x{:.1} -> {}x{}",
+            window_width, window_height, terminal_canvas_width, terminal_canvas_height,
+            cell_width, cell_height, cols, rows
+        ),
+    );
+
+    if let Err(err) = session.resize(cols, rows) {
+        logging::log_line("ERROR", &format!("direct_terminal_resize failed: {err}"));
+    }
+
+    // Also trigger repaint to update the canvas
+    force_terminal_repaint();
+}
 
 /// Base font size for terminal cells.
 #[cfg(target_os = "macos")]
@@ -304,6 +439,12 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
     let error_msg: RwSignal<Option<String>> = RwSignal::new(None);
     let last_size: RwSignal<(u16, u16)> = RwSignal::new((0, 0));
     let pending_size: RwSignal<(u16, u16)> = RwSignal::new((0, 0));
+    let last_resize_request: RwSignal<Instant> = RwSignal::new(Instant::now());
+    let resize_trigger = ExtSendTrigger::new();
+
+    // Register the resize trigger globally so layout.rs can force repaint after animation
+    register_force_repaint_trigger(resize_trigger.clone());
+
     let cell_size: RwSignal<(f64, f64)> = RwSignal::new((0.0, 0.0));
     let cell_y_offset: RwSignal<f64> = RwSignal::new(0.0);
     let last_pty_resize_at: RwSignal<Instant> = RwSignal::new(Instant::now());
@@ -355,6 +496,8 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
 
                 match TerminalSession::new(&workspace_root, notify) {
                     Ok(new_session) => {
+                        // Register session globally for direct resize access
+                        register_terminal_session(&new_session);
                         current_session = Some(new_session.clone());
                         session.set(Some(new_session));
                     }
@@ -380,7 +523,9 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
                 || (size.height - prev_canvas_height).abs() > 1.0;
             
             let (mut cell_width, mut cell_height) = cell_size.get_untracked();
-            if cell_width <= 0.0 || cell_height <= 0.0 || canvas_size_changed {
+            
+            // Ensure cell metrics are always up-to-date
+            if canvas_size_changed || cell_width <= 0.0 || cell_height <= 0.0 {
                 let attrs = Attrs::new()
                     .font_size(TERMINAL_FONT_SIZE)
                     .family(&font_families);
@@ -389,46 +534,48 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
                 metrics_layout.set_text("m", base_attrs_list, None);
                 let metrics_size = metrics_layout.size();
                 cell_width = metrics_size.width.max(1.0);
-                // Add vertical breathing room (Ghostty-style line height).
                 cell_height = (metrics_size.height * 1.25).max(1.0);
+
                 cell_size.set((cell_width, cell_height));
                 cell_y_offset.set((cell_height - metrics_size.height) / 2.0);
-                
-                if canvas_size_changed {
-                    last_canvas_size.set((size.width, size.height));
-                    crate::logging::log_line(
-                        "INFO",
-                        &format!("cell_size recalculated: {:.1}x{:.1} (canvas: {:.0}x{:.0})",
-                                 cell_width, cell_height, size.width, size.height),
-                    );
-                }
+                last_canvas_size.set((size.width, size.height));
+                // Update global cache for direct resize from animation timer
+                update_cached_cell_size(cell_width, cell_height);
             }
 
             let y_offset = cell_y_offset.get_untracked();
 
-            // 5. Resize terminal if needed
+            // 5. Calculate terminal grid size and trigger resize if needed
             // Subtract padding (8px on each side = 16px total)
             let available_width = (size.width - 16.0).max(1.0);
             let available_height = (size.height - 16.0).max(1.0);
             let cols = (available_width / cell_width).floor().max(1.0) as u16;
             let rows = (available_height / cell_height).floor().max(1.0) as u16;
 
-            {
-                let (prev_cols, prev_rows) = last_size.get_untracked();
-                if cols != prev_cols || rows != prev_rows {
-                    // Don't resize PTY here - just update pending_size signal.
-                    // A separate Effect will handle the actual resize asynchronously
-                    // to avoid blocking the render loop.
-                    pending_size.set((cols, rows));
-                    crate::logging::log_line(
-                        "INFO",
-                        &format!("Pending PTY resize: {}x{} (was {}x{})", cols, rows, prev_cols, prev_rows),
-                    );
-                }
+            // Check if grid size changed
+            let (last_cols, last_rows) = last_size.get_untracked();
+            let size_changed = cols != last_cols || rows != last_rows;
+
+            if size_changed {
+                // Update pending size for debounced PTY resize
+                pending_size.set((cols, rows));
+                last_resize_request.set(Instant::now());
+
+                logging::breadcrumb(format!(
+                    "grid size changed: {}x{} -> {}x{} (canvas {:.0}x{:.0})",
+                    last_cols, last_rows, cols, rows, size.width, size.height
+                ));
+
+                // Spawn a timer to trigger PTY resize later (debounce)
+                let trigger = resize_trigger.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(30));
+                    register_ext_trigger(trigger);
+                });
             }
 
-            // Render using last_size, not pending_size, to avoid flicker
-            let (cols, rows) = last_size.get_untracked();
+            // Always render with current calculated size (not last_size)
+            // This ensures immediate visual update even before PTY resize completes
 
             // 6. Render content
             let palette = TerminalPalette::for_theme(theme);
@@ -602,6 +749,9 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
 
     let canvas_id = terminal_canvas.id();
 
+    // Track if we're in selection mode (primary button held)
+    let is_selecting = RwSignal::new(false);
+
     // Wrap canvas to track window_origin
     let terminal_wrapper = terminal_canvas
         .on_event_cont(EventListener::WindowGotFocus, move |_| {
@@ -613,7 +763,7 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
     let terminal_wrapper_id = terminal_wrapper.id();
     
     // Effect to trigger repaint when session/error state changes
-    Effect::new(move |_| {
+    create_effect(move |_| {
         session.track();
         error_msg.track();
         term_update_trigger.track();
@@ -621,7 +771,7 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
     });
 
     // Effect to update IME cursor position based on terminal cursor
-    Effect::new(move |_| {
+    create_effect(move |_| {
         cell_size.track();
         session.track();
         term_update_trigger.track();
@@ -685,39 +835,79 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
         }
     });
 
-    // Effect to handle PTY resize asynchronously (not in render loop)
-    Effect::new(move |_| {
-        let (pending_cols, pending_rows) = pending_size.get();
+    // Effect to handle PTY resize asynchronously (debounced)
+    create_effect(move |_| {
+        let effect_start = Instant::now();
+        resize_trigger.track();
+        let (pending_cols, pending_rows) = pending_size.get_untracked();
         let (last_cols, last_rows) = last_size.get_untracked();
-        
-        if pending_cols != last_cols || pending_rows != last_rows {
-            if let Some(sess) = session.get_untracked() {
-                if let Err(err) = sess.resize(pending_cols, pending_rows) {
-                    crate::logging::log_line(
-                        "ERROR",
-                        &format!("Terminal resize failed: {err}"),
-                    );
-                } else {
-                    last_size.set((pending_cols, pending_rows));
-                    last_pty_resize_at.set(Instant::now());
-                    crate::logging::log_line(
-                        "INFO",
-                        &format!("PTY resized: {}x{} (was {}x{})", pending_cols, pending_rows, last_cols, last_rows),
-                    );
-                }
+
+        if pending_cols == 0 || pending_rows == 0 {
+            return;
+        }
+
+        // If nothing changed, don't bother
+        if pending_cols == last_cols && pending_rows == last_rows {
+            return;
+        }
+
+        // Debounce check
+        let last_request = last_resize_request.get_untracked();
+        let debounce_wait = last_request.elapsed();
+        if debounce_wait < Duration::from_millis(50) {
+            logging::breadcrumb(format!(
+                "resize effect: debounce skip (waited {}ms)",
+                debounce_wait.as_millis()
+            ));
+            return;
+        }
+
+        logging::log_line(
+            "DEBUG",
+            &format!(
+                "resize effect triggered: {}x{} -> {}x{} (debounce waited {}ms)",
+                last_cols, last_rows, pending_cols, pending_rows, debounce_wait.as_millis()
+            ),
+        );
+
+        if let Some(sess) = session.get_untracked() {
+            logging::breadcrumb(format!(
+                "terminal pty resize call (debounced): {pending_cols}x{pending_rows} (was {last_cols}x{last_rows})"
+            ));
+            let resize_start = Instant::now();
+            if let Err(err) = sess.resize(pending_cols, pending_rows) {
+                crate::logging::log_line(
+                    "ERROR",
+                    &format!("Terminal resize failed: {err}"),
+                );
+            } else {
+                let resize_ms = resize_start.elapsed().as_micros() as f64 / 1000.0;
+                last_size.set((pending_cols, pending_rows));
+                last_pty_resize_at.set(Instant::now());
+                let effect_ms = effect_start.elapsed().as_micros() as f64 / 1000.0;
+                crate::logging::log_line(
+                    "DEBUG",
+                    &format!(
+                        "PTY resized: {}x{} (was {}x{}) resize={:.2}ms effect_total={:.2}ms",
+                        pending_cols, pending_rows, last_cols, last_rows, resize_ms, effect_ms
+                    ),
+                );
             }
         }
     });
 
     let terminal_wrapper = terminal_wrapper
+        .keyboard_navigable()
         .style(move |s| {
             s.width_full()
                 .height_full()
                 .background(theme.panel_bg)
-                .focusable(true)
         })
         .on_event_cont(EventListener::WindowResized, move |_| {
             ime_update_tick.update(|tick| *tick = tick.wrapping_add(1));
+            // Force canvas repaint on window resize to avoid stale content during animation
+            canvas_id.request_layout();
+            canvas_id.request_paint();
         })
         .on_event(EventListener::FocusGained, move |_| {
             logging::breadcrumb("terminal focus gained".to_string());
@@ -737,12 +927,9 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
         })
         .on_event(EventListener::KeyDown, move |event| {
             logging::measure_ui_event("terminal keydown", || {
-                if let Event::Key(key_event) = event {
-                    if key_event.state != KeyState::Down {
-                        return EventPropagation::Continue;
-                    }
-
-                    match &key_event.key {
+                if let Event::KeyDown(key_event) = event {
+                    let key = &key_event.key.logical_key;
+                    match key {
                         Key::Named(named) => {
                             logging::breadcrumb(format!("terminal keydown: {named:?}"));
                         }
@@ -752,13 +939,14 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
                                 text.len()
                             ));
                         }
+                        _ => {}
                     }
                     ime_update_tick.update(|tick| *tick = tick.wrapping_add(1));
 
                     // Check for restart if session is inactive
                     if let Some(session_arc) = session.get_untracked() {
                         if !session_arc.is_active() {
-                            if key_event.key == Key::Named(NamedKey::Enter) {
+                            if matches!(key, Key::Named(NamedKey::Enter)) {
                                 logging::breadcrumb("terminal restart".to_string());
                                 session.set(None);
                                 error_msg.set(None);
@@ -770,7 +958,7 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
 
                     // Check for restart if we have an error (e.g. failed to start)
                     if error_msg.get_untracked().is_some() {
-                         if key_event.key == Key::Named(NamedKey::Enter) {
+                         if matches!(key, Key::Named(NamedKey::Enter)) {
                             logging::breadcrumb("terminal restart (error)".to_string());
                             session.set(None);
                             error_msg.set(None);
@@ -782,7 +970,6 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
                         return EventPropagation::Continue;
                     };
 
-                    let key = &key_event.key;
                     let modifiers = key_event.modifiers;
 
                     // Handle Cmd+C / Cmd+V for clipboard integration.
@@ -875,6 +1062,7 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
                                 handled = true;
                             }
                         }
+                        _ => {}
                     }
 
                     if handled {
@@ -927,8 +1115,8 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
                     return EventPropagation::Continue;
                 }
 
-                if let Some(delta) = event.pixel_scroll_delta_vec2() {
-                    let dy = delta.y;
+                if let Event::PointerWheel(wheel_event) = event {
+                    let dy = wheel_event.delta.y;
                     let lines = (dy / cell_height).round() as i32;
                     if lines != 0 {
                         logging::breadcrumb(format!("terminal scroll: {lines}"));
@@ -951,15 +1139,16 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
                     return EventPropagation::Continue;
                 }
 
-                if let Event::Pointer(UiPointerEvent::Down(button_event)) = event {
-                    if button_event.button != Some(PointerButton::Primary) {
+                if let Event::PointerDown(pointer_event) = event {
+                    if !pointer_event.button.is_primary() {
                         return EventPropagation::Continue;
                     }
 
-                    if let Some(pos) = event.point() {
+                    let pos = pointer_event.pos;
+                    {
                         logging::breadcrumb("terminal pointer down".to_string());
                         canvas_id.request_focus();
-                        canvas_id.request_active();
+                        is_selecting.set(true);
 
                         let x = pos.x;
                         let y = pos.y;
@@ -1025,12 +1214,14 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
                     return EventPropagation::Continue;
                 }
 
-                if let Event::Pointer(UiPointerEvent::Move(update)) = event {
-                    if !update.current.buttons.contains(PointerButton::Primary) {
+                if let Event::PointerMove(pointer_event) = event {
+                    // Only track selection when we're selecting (primary button was pressed)
+                    if !is_selecting.get_untracked() {
                         return EventPropagation::Continue;
                     }
 
-                    if let Some(pos) = event.point() {
+                    let pos = pointer_event.pos;
+                    {
                         let x = pos.x;
                         let y = pos.y;
 
@@ -1087,21 +1278,21 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
         })
         .on_event(EventListener::PointerUp, move |event| {
             logging::measure_ui_event("terminal pointer up", || {
-                if let Event::Pointer(UiPointerEvent::Up(_)) = event {
-                    canvas_id.clear_active();
+                if let Event::PointerUp(_) = event {
+                    is_selecting.set(false);
                 }
                 EventPropagation::Continue
             })
         });
 
     v_stack((
-        Label::new("Terminal").style(move |s| {
+        label(|| "Terminal").style(move |s| {
             s.font_size(12.0)
                 .font_bold()
                 .color(theme.text_muted)
         }),
         meta_text(format!("Workspace: {workspace_name}"), theme),
-        Container::new(terminal_wrapper).style(move |s| {
+        container(terminal_wrapper).style(move |s| {
             s.width_full()
                 .height_full()
                 .padding(8.0)
@@ -1117,14 +1308,14 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
 pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
     let workspace_name = workspace.name.clone();
     v_stack((
-        Label::new("Terminal").style(move |s| {
+        label(|| "Terminal").style(move |s| {
             s.font_size(12.0)
                 .font_bold()
                 .color(theme.text_muted)
         }),
         meta_text(format!("Workspace: {workspace_name}"), theme),
-        Container::new(Label::new(
-            "Terminal is only available on macOS in this build.",
+        container(label(||
+            "Terminal is only available on macOS in this build."
         ))
         .style(move |s| {
             s.width_full()

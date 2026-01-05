@@ -131,21 +131,32 @@ pub fn dump_breadcrumbs(reason: &str) {
 pub fn record_terminal_render(duration: Duration, cell_count: usize, cols: u16, rows: u16) {
     let now = now_millis();
     let ms = duration.as_millis() as u64;
-    LAST_RENDER_MS
+    let _prev_ms = LAST_RENDER_MS
         .get_or_init(|| AtomicU64::new(0))
-        .store(ms, Ordering::Relaxed);
+        .swap(ms, Ordering::Relaxed);
     LAST_RENDER_AT_MS
         .get_or_init(|| AtomicU64::new(0))
         .store(now, Ordering::Relaxed);
     LAST_RENDER_CELLS
         .get_or_init(|| AtomicU64::new(0))
         .store(cell_count as u64, Ordering::Relaxed);
-    LAST_RENDER_COLS
+    let prev_cols = LAST_RENDER_COLS
         .get_or_init(|| AtomicU64::new(0))
-        .store(cols as u64, Ordering::Relaxed);
-    LAST_RENDER_ROWS
+        .swap(cols as u64, Ordering::Relaxed) as u16;
+    let prev_rows = LAST_RENDER_ROWS
         .get_or_init(|| AtomicU64::new(0))
-        .store(rows as u64, Ordering::Relaxed);
+        .swap(rows as u64, Ordering::Relaxed) as u16;
+
+    // Log when grid size changes (resize happened)
+    if prev_cols != cols || prev_rows != rows {
+        log_line(
+            "DEBUG",
+            &format!(
+                "terminal render after resize: {}ms cells={} grid={}x{} (was {}x{})",
+                ms, cell_count, cols, rows, prev_cols, prev_rows
+            ),
+        );
+    }
 
     if ms >= SLOW_RENDER_MS {
         log_line(
