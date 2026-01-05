@@ -453,6 +453,8 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
     let last_ime_cursor_area: RwSignal<Option<(floem::kurbo::Point, floem::kurbo::Size)>> =
         RwSignal::new(None);
     let last_canvas_size: RwSignal<(f64, f64)> = RwSignal::new((0.0, 0.0));
+    // Scroll accumulator for smooth touchpad scrolling (accumulates sub-line deltas)
+    let scroll_accumulator: RwSignal<f64> = RwSignal::new(0.0);
     // Trigger repaints when terminal content changes (from background thread).
     let term_update_trigger = workspace.terminal_trigger;
 
@@ -645,17 +647,22 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
                         std::mem::swap(&mut fg_color, &mut bg_color);
                     }
 
-                    if is_selected {
-                        std::mem::swap(&mut fg_color, &mut bg_color);
-                    }
-
                     // Check if this is a wide character (CJK, emoji, etc.)
                     let is_wide = flags.contains(Flags::WIDE_CHAR);
                     let cell_display_width = if is_wide { cell_width * 2.0 } else { cell_width };
 
-                    // The canvas is already filled with `theme.panel_bg` once per frame.
-                    // Avoid per-cell fills when the background matches the base.
-                    if is_selected || bg_color != default_bg {
+                    // Selection uses consistent colors for clean appearance (no grid effect)
+                    if is_selected {
+                        // White background, dark text for selection
+                        // Extend rect by 1px to eliminate sub-pixel gaps between cells
+                        let selection_bg = Color::from_rgb8(255, 255, 255);
+                        let selection_fg = Color::from_rgb8(30, 30, 30);
+                        fg_color = selection_fg;
+                        let bg_brush = Brush::from(selection_bg);
+                        let cell_rect = Rect::new(x, y, x + cell_display_width + 1.0, y + cell_height + 1.0);
+                        cx.fill(&cell_rect, &bg_brush, 0.0);
+                    } else if bg_color != default_bg {
+                        // Non-selected cells: only fill if bg differs from default
                         let bg_brush = Brush::from(bg_color);
                         let cell_rect = Rect::new(x, y, x + cell_display_width, y + cell_height);
                         cx.fill(&cell_rect, &bg_brush, 0.0);
@@ -1118,12 +1125,30 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
 
                 if let Event::PointerWheel(wheel_event) = event {
                     let dy = wheel_event.delta.y;
-                    let lines = (dy / cell_height).round() as i32;
+
+                    // Accumulate scroll delta for smooth touchpad scrolling
+                    // Small gestures build up until they reach a full line
+                    let mut accumulated = scroll_accumulator.get_untracked() + dy;
+
+                    // Calculate whole lines from accumulated scroll
+                    let lines = (accumulated / cell_height).trunc() as i32;
+
                     if lines != 0 {
-                        logging::breadcrumb(format!("terminal scroll: {lines}"));
-                        session.scroll_display(lines);
-                        return EventPropagation::Stop;
+                        // Subtract the lines we're scrolling from accumulator
+                        accumulated -= (lines as f64) * cell_height;
+                        scroll_accumulator.set(accumulated);
+
+                        // Negate: scrolling up (negative dy) should show earlier content (positive delta)
+                        let scroll_delta = -lines;
+                        logging::breadcrumb(format!("terminal scroll: dy={dy:.1} acc={accumulated:.1} lines={scroll_delta}"));
+                        session.scroll_display(scroll_delta);
+                        canvas_id.request_paint();
+                    } else {
+                        // Just accumulate, no scroll yet
+                        scroll_accumulator.set(accumulated);
                     }
+
+                    return EventPropagation::Stop;
                 }
 
                 EventPropagation::Continue
@@ -1196,6 +1221,7 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
                             ));
                         });
 
+                        canvas_id.request_paint();
                         return EventPropagation::Stop;
                     }
                 }
@@ -1270,6 +1296,7 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
                             }
                         });
 
+                        canvas_id.request_paint();
                         return EventPropagation::Stop;
                     }
                 }
