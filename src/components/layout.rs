@@ -17,7 +17,7 @@ const LEFT_INITIAL_WIDTH: f64 = 200.0;
 const CENTER_MIN_WIDTH: f64 = 100.0;
 const RIGHT_MIN_WIDTH: f64 = 100.0;
 const RIGHT_INITIAL_WIDTH: f64 = 260.0;
-const HANDLE_WIDTH: f64 = 10.0;
+const HANDLE_WIDTH: f64 = 1.0;
 
 /// Animation detection: track when resize burst started.
 /// We use a fixed 1.2s timer from first event, because WindowResized events themselves

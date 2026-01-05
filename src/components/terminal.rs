@@ -1037,6 +1037,7 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
                         Key::Named(named) => {
                             let bytes: Option<&[u8]> = match named {
                                 NamedKey::Enter => Some(b"\r"),
+                                NamedKey::Space => Some(b" "),
                                 NamedKey::Tab => Some(b"\t"),
                                 NamedKey::Backspace => Some(&[0x7f]),
                                 NamedKey::Escape => Some(b"\x1b"),
