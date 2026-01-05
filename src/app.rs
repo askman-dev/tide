@@ -1,6 +1,6 @@
 use crate::components::{
-    app_shell, file_tree_view, git_status_view, main_layout, panel_view, tab_bar, tab_button,
-    terminal_view, FILE, FOLDER, GIT,
+    app_shell, collapsible_panel_view, file_tree_view, git_status_view, main_layout, tab_bar,
+    tab_button, tab_button_with_menu, terminal_view, FILE, FOLDER, GIT,
 };
 use crate::model::WorkspaceTab;
 use crate::services::{build_tree_entries, git_status_entries};
@@ -12,6 +12,9 @@ use crate::logging;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Duration;
+
+#[cfg(target_os = "macos")]
+use std::process::Command;
 
 static UI_WATCHDOG: OnceLock<()> = OnceLock::new();
 
@@ -30,14 +33,72 @@ pub fn app_view() -> impl IntoView {
         |tab| tab.id,
         move |tab| {
             let tab_id = tab.id;
-            let tab_name = tab.name.clone();
-            tab_button(
-                tab_name,
+            let tab_name_signal = tab.name;
+            let tab_root_signal = tab.root;
+            let tab_file_tree_signal = tab.file_tree;
+            let tab_git_status_signal = tab.git_status;
+
+            tab_button_with_menu(
+                tab_name_signal,  // Pass the signal for reactive updates
                 move || active_tab.get() == tab_id,
                 theme,
+                // on_click: select this tab
                 move || {
-                    // logging::breadcrumb(format!("tab select: id={tab_id}"));
                     active_tab.set(tab_id);
+                },
+                // on_open_folder: open file picker and change workspace
+                move || {
+                    let current_root = tab_root_signal.get();
+                    logging::log_line("INFO", &format!("open folder: tab_id={tab_id}"));
+                    #[cfg(target_os = "macos")]
+                    {
+                        // Use rfd to pick a folder
+                        let dialog = rfd::FileDialog::new()
+                            .set_directory(&current_root)
+                            .pick_folder();
+                        if let Some(new_path) = dialog {
+                            logging::log_line(
+                                "INFO",
+                                &format!("selected folder: {}", new_path.display()),
+                            );
+                            // Update the tab signals - UI will react automatically
+                            let name = new_path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("workspace")
+                                .to_string();
+                            tab_name_signal.set(name);
+                            tab_root_signal.set(new_path.clone());
+                            tab_file_tree_signal.set(build_tree_entries(&new_path, 3));
+                            tab_git_status_signal.set(git_status_entries(&new_path));
+                        }
+                    }
+                },
+                // on_reveal_in_finder: open folder in Finder
+                move || {
+                    let root = tab_root_signal.get();
+                    logging::log_line(
+                        "INFO",
+                        &format!("reveal in finder: {}", root.display()),
+                    );
+                    #[cfg(target_os = "macos")]
+                    {
+                        let _ = Command::new("open").arg(&root).spawn();
+                    }
+                },
+                // on_close: close this tab
+                move || {
+                    logging::log_line("INFO", &format!("close tab: id={tab_id}"));
+                    tabs.update(|tabs_vec| {
+                        tabs_vec.retain(|t| t.id != tab_id);
+                    });
+                    // If closing the active tab, switch to another tab
+                    if active_tab.get() == tab_id {
+                        let remaining = tabs.get();
+                        if let Some(first) = remaining.first() {
+                            active_tab.set(first.id);
+                        }
+                    }
                 },
             )
         },
@@ -55,7 +116,7 @@ pub fn app_view() -> impl IntoView {
                 .get()
                 .into_iter()
                 .find(|tab| tab.id == active_id)
-                .map(|tab| tab.root)
+                .map(|tab| tab.root.get())
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
             logging::breadcrumb(format!("new tab click: id={id}"));
             logging::log_line(
@@ -67,7 +128,11 @@ pub fn app_view() -> impl IntoView {
         },
     );
 
-    let tabs_bar = tab_bar(tab_list, new_tab_button, theme);
+    // Combine tabs and + button together so + is right next to tabs
+    let tabs_with_add = h_stack((tab_list, new_tab_button))
+        .style(|s| s.flex_row().col_gap(6.0).items_center());
+
+    let tabs_bar = tab_bar(tabs_with_add, empty(), theme);
 
     let content = dyn_container(move || active_tab.get(), move |tab_id| {
         let tabs_vec = tabs.get();
@@ -110,51 +175,61 @@ fn install_ui_watchdog() {
 }
 
 fn workspace_view(tab: WorkspaceTab, theme: UiTheme) -> impl IntoView {
-    let workspace_name = tab.name.clone();
-    let workspace_path = tab.root.to_string_lossy().to_string();
-    let file_tree_entries = tab.file_tree.clone();
-    let git_status_entries = tab.git_status.clone();
+    let workspace_name = tab.name;
+    let workspace_root = tab.root;
+    let file_tree_entries = tab.file_tree;
+    let git_status_entries_signal = tab.git_status;
 
-    let project_header = project_header_view(workspace_name, workspace_path, theme);
-    let files_panel = panel_view(
+    // Collapse state signals - all expanded by default
+    let files_expanded = RwSignal::new(true);
+    let changes_expanded = RwSignal::new(true);
+    let history_expanded = RwSignal::new(true);
+
+    let project_header = project_header_view(workspace_name, workspace_root, theme)
+        .style(|s| s.flex_shrink(0.0)); // Fixed height, don't shrink
+    let files_panel = collapsible_panel_view(
         "File explorer",
         FOLDER,
-        file_tree_view(file_tree_entries, theme)
-            .scroll()
-            .style(|s| s.width_full().height_full()),
+        file_tree_view_reactive(file_tree_entries, theme)
+            .style(|s| s.width_full()),
+        files_expanded,
         theme,
     );
-    let changes_panel = panel_view(
+    let changes_panel = collapsible_panel_view(
         "Changes",
         GIT,
-        git_status_view(git_status_entries, theme)
-            .scroll()
-            .style(|s| s.width_full().height_full()),
+        git_status_view_reactive(git_status_entries_signal, theme)
+            .style(|s| s.width_full()),
+        changes_expanded,
         theme,
-    )
-    .style(|s| s.height(140.0));
-    let history_panel = panel_view(
+    );
+    let history_panel = collapsible_panel_view(
         "History",
         FILE,
         history_view(theme)
-            .scroll()
-            .style(|s| s.width_full().height_full()),
+            .style(|s| s.width_full()),
+        history_expanded,
         theme,
-    )
-    .style(|s| s.height(140.0));
+    );
 
+    // VSCode-style sidebar: no outer scroll, panels share space
+    // Headers always visible, expanded panels divide remaining height
     let left_column = v_stack((
         project_header,
-        files_panel.style(|s| s.flex_grow(1.0)),
+        files_panel,
         changes_panel,
         history_panel,
     ))
     .style(move |s| {
+        use floem::style::{OverflowX, OverflowY};
         s.width_full()
             .height_full()
-            .row_gap(6.0)
+            .row_gap(4.0)
             .background(theme.panel_bg)
             .padding(6.0)
+            // Critical: prevent outer overflow, force internal scrolling
+            .set(OverflowX, floem::taffy::Overflow::Hidden)
+            .set(OverflowY, floem::taffy::Overflow::Hidden)
     });
 
     let center_column = terminal_view(theme, tab);
@@ -163,10 +238,14 @@ fn workspace_view(tab: WorkspaceTab, theme: UiTheme) -> impl IntoView {
     main_layout(left_column, center_column, right_column, theme)
 }
 
-fn project_header_view(name: String, path: String, theme: UiTheme) -> impl IntoView {
+fn project_header_view(
+    name: RwSignal<String>,
+    root: RwSignal<PathBuf>,
+    theme: UiTheme,
+) -> impl IntoView {
     v_stack((
-        label(move || name.clone()).style(move |s| s.font_size(13.0).font_bold().color(theme.text)),
-        label(move || path.clone()).style(move |s| {
+        label(move || name.get()).style(move |s| s.font_size(13.0).font_bold().color(theme.text)),
+        label(move || root.get().to_string_lossy().to_string()).style(move |s| {
             s.font_size(11.0)
                 .color(theme.text_soft)
                 .text_ellipsis()
@@ -180,6 +259,28 @@ fn project_header_view(name: String, path: String, theme: UiTheme) -> impl IntoV
             .border_color(theme.border_subtle)
             .background(theme.panel_bg)
     })
+}
+
+/// Reactive file tree view - rebuilds when signal changes
+fn file_tree_view_reactive(
+    entries: RwSignal<Vec<crate::model::TreeEntry>>,
+    theme: UiTheme,
+) -> impl IntoView {
+    dyn_container(
+        move || entries.get(),
+        move |entries_vec| file_tree_view(entries_vec, theme).into_any(),
+    )
+}
+
+/// Reactive git status view - rebuilds when signal changes
+fn git_status_view_reactive(
+    entries: RwSignal<Vec<String>>,
+    theme: UiTheme,
+) -> impl IntoView {
+    dyn_container(
+        move || entries.get(),
+        move |entries_vec| git_status_view(entries_vec, theme).into_any(),
+    )
 }
 
 fn history_view(theme: UiTheme) -> impl IntoView {
@@ -379,10 +480,10 @@ fn build_tab(id: usize, root: PathBuf) -> WorkspaceTab {
 
     WorkspaceTab {
         id,
-        name,
-        root,
-        file_tree,
-        git_status,
+        name: RwSignal::new(name),
+        root: RwSignal::new(root),
+        file_tree: RwSignal::new(file_tree),
+        git_status: RwSignal::new(git_status),
         terminal: RwSignal::new(None),
         terminal_trigger: ExtSendTrigger::new(),
     }

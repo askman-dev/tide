@@ -432,8 +432,8 @@ fn resolve_bg_color(
 /// On non-macOS platforms it shows a simple placeholder message.
 #[cfg(target_os = "macos")]
 pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
-    let workspace_name = workspace.name.clone();
-    let workspace_root = workspace.root.clone();
+    let workspace_name = workspace.name;
+    let workspace_root = workspace.root.get(); // Get the PathBuf value from signal
 
     let session = workspace.terminal;
     let error_msg: RwSignal<Option<String>> = RwSignal::new(None);
@@ -1292,7 +1292,7 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
                 .font_bold()
                 .color(theme.text_muted)
         }),
-        meta_text(format!("Workspace: {workspace_name}"), theme),
+        meta_text(format!("Workspace: {}", workspace_name.get()), theme),
         container(terminal_wrapper).style(move |s| {
             s.width_full()
                 .height_full()
@@ -1307,14 +1307,14 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
 
 #[cfg(not(target_os = "macos"))]
 pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
-    let workspace_name = workspace.name.clone();
+    let workspace_name = workspace.name;
     v_stack((
         label(|| "Terminal").style(move |s| {
             s.font_size(12.0)
                 .font_bold()
                 .color(theme.text_muted)
         }),
-        meta_text(format!("Workspace: {workspace_name}"), theme),
+        meta_text(format!("Workspace: {}", workspace_name.get()), theme),
         container(label(||
             "Terminal is only available on macOS in this build."
         ))

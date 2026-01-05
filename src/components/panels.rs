@@ -1,4 +1,4 @@
-use crate::components::atoms::{icon, list_item, list_label, panel_header};
+use crate::components::atoms::{collapsible_panel_header, icon, list_item, list_label, panel_header};
 use crate::components::icons::{CHEVRON_DOWN, CHEVRON_RIGHT, FILE, FOLDER, GIT};
 use crate::logging;
 use crate::model::TreeEntry;
@@ -6,6 +6,7 @@ use crate::services::list_dir_entries;
 use crate::theme::{TREE_INDENT, UiTheme};
 use floem::ext_event::{register_ext_trigger, ExtSendTrigger};
 use floem::prelude::*;
+use floem::style::Display;
 use floem::reactive::create_effect;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -27,6 +28,69 @@ pub fn panel_view<V: IntoView + 'static>(
         }),
     ))
     .style(move |s| s.size_full().background(theme.panel_bg))
+}
+
+/// Collapsible panel with internal scrolling (VSCode-style)
+/// - Header is always visible with fixed height
+/// - Expanded panels share available space via flex-grow
+/// - Body scrolls internally, no outer scrollbars
+/// - Multiple expanded panels divide space equally
+pub fn collapsible_panel_view<V: IntoView + 'static>(
+    title: &str,
+    icon_svg: &'static str,
+    body: V,
+    expanded: RwSignal<bool>,
+    theme: UiTheme,
+) -> impl IntoView {
+    let header_title = title.to_string();
+
+    // Body container: internal scroll, no horizontal overflow
+    let body_container = container(body)
+        .style(|s| s.width_full())
+        .scroll()
+        .scroll_style(|s| s.overflow_clip(true)) // Hide horizontal scrollbar
+        .style(move |s| {
+            use floem::style::OverflowX;
+            let mut style = s.width_full().background(theme.panel_bg);
+            if expanded.get() {
+                // When expanded: take available space, allow internal scroll
+                style = style
+                    .flex_grow(1.0)
+                    .flex_shrink(1.0)
+                    .min_height(0.0) // Critical: allows shrinking below content height
+                    .set(OverflowX, floem::taffy::Overflow::Hidden); // No horizontal scroll
+            } else {
+                // When collapsed: completely hidden
+                style = style.display(Display::None);
+            }
+            style
+        });
+
+    v_stack((
+        collapsible_panel_header(header_title, icon_svg, expanded, theme),
+        body_container,
+    ))
+    .style(move |s| {
+        use crate::theme::HEADER_HEIGHT;
+        use floem::style::OverflowY;
+        if expanded.get() {
+            // Expanded: participate in flex layout, can grow and shrink
+            // min_height ensures header is always visible (28px header + some content)
+            s.width_full()
+                .flex_grow(1.0)
+                .flex_shrink(1.0)
+                .min_height(HEADER_HEIGHT + 20.0) // At least header + some content visible
+                .set(OverflowY, floem::taffy::Overflow::Hidden) // Prevent overflow
+                .background(theme.panel_bg)
+        } else {
+            // Collapsed: only header height, don't grow
+            s.width_full()
+                .flex_grow(0.0)
+                .flex_shrink(0.0)
+                .height(HEADER_HEIGHT) // Exact header height
+                .background(theme.panel_bg)
+        }
+    })
 }
 
 pub fn file_tree_view(entries: Vec<TreeEntry>, theme: UiTheme) -> impl IntoView {

@@ -7,10 +7,10 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct WorkspaceTab {
     pub id: usize,
-    pub name: String,
-    pub root: PathBuf,
-    pub file_tree: Vec<TreeEntry>,
-    pub git_status: Vec<String>,
+    pub name: RwSignal<String>,
+    pub root: RwSignal<PathBuf>,
+    pub file_tree: RwSignal<Vec<TreeEntry>>,
+    pub git_status: RwSignal<Vec<String>>,
     pub terminal: RwSignal<Option<Arc<TerminalSession>>>,
     pub terminal_trigger: ExtSendTrigger,
 }

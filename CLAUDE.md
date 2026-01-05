@@ -22,9 +22,10 @@ Main dependencies:
 - portable-pty 0.9.0 (macOS) - PTY management
 - arboard 3 (macOS) - Clipboard operations
 - dispatch 0.2 (macOS) - GCD for direct terminal resize
+- rfd 0.15 (macOS) - Native file dialog for folder picker
 
 Debug environment variables:
-- Default (unset): Standard macOS titlebar - no blur during zoom animation
+- Default (unset): Hidden titlebar (like Lapce) - tabs at top, may have brief blur during zoom
 - `TIDE_WINDOW_STYLE=fullsize` - Transparent titlebar + full content view (tabs in titlebar, has zoom blur)
 - `TIDE_WINDOW_STYLE=hidden` - Hidden titlebar via floem's show_titlebar(false) - WARNING: causes zoom blur
 - `TIDE_DISALLOW_HIDPI=1` - Disable HiDPI backing scale (may reduce resize/GPU pressure)
@@ -36,16 +37,16 @@ Note: floem's `show_titlebar(false)` on macOS internally enables `fullsize_conte
 ```
 src/
 ├── main.rs           # Entry point, window configuration
-├── app.rs            # App view composition, tab management, UI watchdog
+├── app.rs            # App view composition, tab management with context menus (open folder, reveal in Finder, close), UI watchdog, reactive view wrappers (file_tree_view_reactive, git_status_view_reactive), VSCode-style collapsible panels in left column (files_expanded, changes_expanded, history_expanded RwSignals)
 ├── logging.rs        # Diagnostics: breadcrumbs, performance tracking, heartbeat monitoring
-├── model.rs          # Data models (WorkspaceTab)
+├── model.rs          # Data models: WorkspaceTab with RwSignal fields (name, root, file_tree, git_status) for reactive UI updates
 ├── theme.rs          # UiTheme with color definitions
 ├── components/
-│   ├── mod.rs        # Public exports: layout views (app_shell, main_layout, tab_bar, get_last_window_size), terminal functions (terminal_view, force_terminal_repaint, direct_terminal_resize on macOS), UI atoms (tab_button), icons
+│   ├── mod.rs        # Public exports: layout views (app_shell, main_layout, tab_bar, get_last_window_size), terminal functions (terminal_view, force_terminal_repaint, direct_terminal_resize on macOS), UI atoms (tab_button, tab_button_with_menu, collapsible_panel_header), panel views (collapsible_panel_view, panel_view), icons
 │   ├── layout.rs     # SplitDragCapture: custom three-pane resizable layout, WindowResized event processing with breadcrumb logging, animation timer (1.2s fixed delay spawned via std::thread), calls direct_terminal_resize when timer expires, window size tracking (LAST_WINDOW_WIDTH/HEIGHT atomics exported via get_last_window_size), debounced resize clamping (100ms intervals via last_clamp_at)
 │   ├── terminal.rs   # Terminal canvas rendering with alacritty_terminal, force repaint trigger system (FORCE_REPAINT_TRIGGER), direct resize system (GLOBAL_TERMINAL_SESSION, CACHED_CELL_WIDTH/HEIGHT atomics), functions: register_force_repaint_trigger, force_terminal_repaint, register_terminal_session, direct_terminal_resize, update_cached_cell_size, get_cached_cell_size
-│   ├── atoms.rs      # Basic UI components (buttons, panels)
-│   ├── panels.rs     # Panel view components (file tree, git status)
+│   ├── atoms.rs      # Basic UI components: tab_button, tab_button_with_menu (h_stack with label + chevron dropdown arrow, uses .popout_menu() for Open Folder/Reveal in Finder/Close actions), collapsible_panel_header (clickable header with chevron toggle), list items, panel headers, splitters, chevron SVG constants (COLLAPSE_CHEVRON, EXPAND_CHEVRON)
+│   ├── panels.rs     # Panel view components: collapsible_panel_view (VSCode-style collapsible panels with internal scrolling), panel_view (static panels), file_tree_view, git_status_view
 │   ├── icons.rs      # Icon definitions (FILE, FOLDER, GIT)
 │   ├── file_tree.rs  # File explorer tree view
 │   └── git_status.rs # Git status display
@@ -78,6 +79,8 @@ src/
 - LAST_WINDOW_WIDTH/HEIGHT atomics store latest window size from WindowResized events (f64::to_bits for atomic storage)
 - get_last_window_size() exports window size atomics for external access (public API via components/mod.rs, uses f64::from_bits to reconstruct)
 - WindowResized event handler: logs breadcrumb with size, updates atomics immediately via LAST_WINDOW_WIDTH.store(size.width.to_bits()), starts animation timer
+- During animation burst (within 1.5s of burst start), SKIPS expensive clamp_widths operations to drain event queue faster - animation timer handles resize after burst settles
+- Logs "WindowResized {w}x{h}: SKIPPED (animation burst) total={ms}ms" at DEBUG level during burst (throttled to 200ms intervals)
 - Animation timer logs "animation timer: 1.2s elapsed, executing resize directly for {w}x{h}" at DEBUG level
 - Uses current_time_ms() helper (SystemTime since UNIX_EPOCH) for millisecond-precision timing
 
@@ -126,6 +129,31 @@ src/
 - Background thread pings UI every 500ms via `ExtSendTrigger`
 - Detects stale heartbeat after 2s, dumps breadcrumbs for debugging
 
+**Reactive UI Pattern** (app.rs, model.rs):
+- WorkspaceTab fields use RwSignal<T> for automatic UI updates: name, root, file_tree, git_status, terminal
+- Signal reading: Use .get() to read current value (e.g., tab.name.get() returns String)
+- Signal writing: Use .set(value) to update and trigger reactive UI updates (e.g., tab_name_signal.set(new_name))
+- Reactive view wrappers: file_tree_view_reactive() and git_status_view_reactive() wrap static views in dyn_container
+- dyn_container pattern: dyn_container(move || signal.get(), |data| view(data)) watches signal and rebuilds view on change
+- View functions accepting signals: project_header_view(name: RwSignal<String>, root: RwSignal<PathBuf>) uses move || name.get() in label closures
+- Tab button with reactive title: tab_button_with_menu(tab_label: RwSignal<String>, ...) uses move || tab_label.get() for live title updates
+- Terminal session persistence: workspace.terminal signal stores Option<Arc<TerminalSession>>, only created once when None, persists across workspace changes
+- Folder picker updates workspace signals: name, root, file_tree (build_tree_entries), git_status (git_status_entries) - terminal session persists unchanged
+- Requires: floem::reactive::{RwSignal, create_effect}
+
+**Tab Dropdown Menu System** (app.rs, atoms.rs):
+- tab_button_with_menu() uses h_stack with two interactive areas: label text (selects tab) + chevron arrow (shows menu)
+- Label text: Uses .on_click_stop() to handle tab selection without propagating to parent
+- Chevron arrow: CHEVRON_DOWN SVG constant (10x10px), uses .popout_menu() to show dropdown menu on click
+- Arrow color: theme.accent when active, theme.text_muted when inactive
+- Menu items: "打开文件夹" (Open Folder), "在 Finder 中定位" (Reveal in Finder), "关闭" (Close)
+- Open Folder: Uses rfd::FileDialog.pick_folder() to select new workspace, updates tab.root/name/file_tree/git_status dynamically
+- Reveal in Finder: Calls Command::new("open").arg(&root).spawn() to open workspace in macOS Finder
+- Close: Removes tab from tabs vector via tabs.update(), switches active_tab to first remaining tab if closing active
+- Menu construction: Menu::new("").entry(MenuItem::new("label").action(callback)).separator()
+- Requires floem::menu::{Menu, MenuItem} and std::process::Command imports
+- All folder operations log to INFO level via logging::log_line()
+
 ## Coding Conventions
 
 ### Logging
@@ -166,7 +194,8 @@ src/
 - Performance constants: BREADCRUMB_CAP=64, SLOW_RENDER_MS=50, SLOW_OP_MS=250, SLOW_UI_EVENT_MS=50
 
 ### UI Constants
-- Pane minimums: LEFT=200, CENTER=300, RIGHT=260 (adjusted to prevent layout overflow in windowed mode, fixes splitter hit-testing issues)
+- Pane minimums: LEFT=100, CENTER=100, RIGHT=100 (reduced to 100px to prevent layout overflow in windowed mode, fixes splitter hit-testing issues)
+- Pane initial widths: LEFT=200, RIGHT=260 (separate from minimums to allow flexible layout)
 - Handle width: 10px
 - Debounce: resize clamping 100ms (prevents UI thread blocking during animations), log throttling 200-250ms
 - Performance thresholds: SLOW_RENDER_MS=50, SLOW_OP_MS=250, SLOW_UI_EVENT_MS=50
@@ -183,6 +212,7 @@ src/
 - **portable-pty** (0.9.0, macOS): Cross-platform PTY interface
 - **arboard** (3.x, macOS): Clipboard operations
 - **dispatch** (0.2, macOS): GCD (Grand Central Dispatch) support for direct terminal resize
+- **rfd** (0.15, macOS): Native file dialog for folder picker in tab context menu
 
 ## Known Issues & Workarounds
 
@@ -190,7 +220,7 @@ src/
 - Animation detection uses fixed 1.2s timer from resize burst start (macOS animation ~1s, events delayed ~2s)
 - Background timer thread bypasses event queue delay to ensure timely repaint after animation
 - Canvas paint may not be called during resize animation despite `request_paint()` calls
-- RIGHT_MIN_WIDTH reduced to 260.0 to prevent layout overflow in windowed mode (fixes splitter hit-testing)
+- All pane minimums reduced to 100px to prevent layout overflow in windowed mode (fixes splitter hit-testing)
 
 ## Critical: floem Version Pin (b215faa)
 
@@ -225,3 +255,43 @@ floem = { git = "https://github.com/lapce/floem", rev = "e0dd862564e3afbad5cba8e
 3. Wait for upstream performance fix
 
 **Verification**: See `swap_memory/tech_spec_window_resize.md` for full technical spec and verification checklist.
+
+## Tab Folder Switching Feature (验收清单)
+
+**Location**: Tab bar at top of window
+
+**Interaction**:
+1. Each tab shows folder name + dropdown arrow (▼)
+2. Click folder name = select tab
+3. Click dropdown arrow (▼) = show menu with:
+   - "打开文件夹" (Open Folder) - opens native file picker
+   - "在 Finder 中定位" (Reveal in Finder) - opens folder in macOS Finder
+   - "关闭" (Close) - closes the tab
+
+**Open Folder Behavior**:
+- Opens rfd::FileDialog native folder picker
+- After selecting new folder:
+  - Tab title updates to new folder name (reactive via RwSignal)
+  - Left panel file tree updates to show new folder contents
+  - Project header (name + path) updates
+  - Git status updates
+  - Terminal session PRESERVES - does NOT reinitialize (session stored in signal, only created once)
+
+**Implementation Files**:
+- src/components/atoms.rs: tab_button_with_menu() with RwSignal<String> for reactive title
+- src/app.rs: on_open_folder callback sets signals directly
+- src/model.rs: WorkspaceTab with RwSignal fields (name, root, file_tree, git_status)
+
+**Collapsible Panel System** (VSCode-style):
+- Each panel (File Explorer, Changes, History) is independently collapsible via collapsible_panel_view()
+- Collapse state tracked via RwSignal<bool> per panel (files_expanded, changes_expanded, history_expanded)
+- Header always visible with clickable chevron: COLLAPSE_CHEVRON (▼ down arrow) when expanded, EXPAND_CHEVRON (▶ right arrow) when collapsed
+- Expanded panels share available vertical space via flex-grow/flex-shrink
+- Internal scrolling: each expanded panel scrolls independently, no outer scrollbars
+- Layout constraints:
+  - project_header: flex_shrink(0.0) - fixed height, never shrinks
+  - Expanded panels: min_height(HEADER_HEIGHT + 20.0) ensures header + some content always visible
+  - Collapsed panels: height(HEADER_HEIGHT) - only header visible
+  - Body container: min_height(0.0) allows shrinking below content height for proper flex layout
+  - Outer container: overflow_x/y hidden prevents outer scrollbars
+- Implementation: collapsible_panel_view() in src/components/panels.rs, workspace_view() in src/app.rs
