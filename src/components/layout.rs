@@ -350,6 +350,7 @@ pub fn tab_bar<T: IntoView + 'static, A: IntoView + 'static>(
     .style(move |s| {
         s.width_full()
             .height(32.0)
+            .flex_shrink(0.0) // Prevent tab bar from shrinking due to content pressure
             .items_center()
             .padding_left(left_padding)
             .padding_right(8.0)
@@ -380,22 +381,32 @@ pub fn main_layout<L: IntoView + 'static, C: IntoView + 'static, R: IntoView + '
     let right_width = RwSignal::new(RIGHT_INITIAL_WIDTH);
 
     let left = container(left).style(move |s| {
+        use floem::style::{OverflowX, OverflowY};
         s.width(left_width.get())
             .min_width(LEFT_MIN_WIDTH)
             .height_full()
             .background(theme.panel_bg)
+            // Contain overflow to prevent content from affecting parent layout
+            .set(OverflowX, floem::taffy::Overflow::Hidden)
+            .set(OverflowY, floem::taffy::Overflow::Hidden)
     });
     let center = container(center).style(move |s| {
+        use floem::style::{OverflowX, OverflowY};
         s.flex_grow(1.0)
             .min_width(CENTER_MIN_WIDTH)
             .height_full()
             .background(theme.surface)
+            .set(OverflowX, floem::taffy::Overflow::Hidden)
+            .set(OverflowY, floem::taffy::Overflow::Hidden)
     });
     let right = container(right).style(move |s| {
+        use floem::style::{OverflowX, OverflowY};
         s.width(right_width.get())
             .min_width(RIGHT_MIN_WIDTH)
             .height_full()
             .background(theme.panel_bg)
+            .set(OverflowX, floem::taffy::Overflow::Hidden)
+            .set(OverflowY, floem::taffy::Overflow::Hidden)
     });
 
     let make_handle = move || {
