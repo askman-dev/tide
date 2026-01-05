@@ -8,16 +8,15 @@ use floem::prelude::*;
 use floem::style::CursorStyle;
 use floem::style::Style;
 use floem::views::drag_window_area;
-use floem::views::Empty;
 use floem::ViewId;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const LEFT_MIN_WIDTH: f64 = 200.0;
-const CENTER_MIN_WIDTH: f64 = 300.0;
-// Right pane default used to be large enough to make the min-sum exceed a typical window width,
-// which caused the layout engine to overflow and our splitter hit-testing to miss in windowed mode.
-const RIGHT_MIN_WIDTH: f64 = 260.0;
+const LEFT_MIN_WIDTH: f64 = 100.0;
+const LEFT_INITIAL_WIDTH: f64 = 200.0;
+const CENTER_MIN_WIDTH: f64 = 100.0;
+const RIGHT_MIN_WIDTH: f64 = 100.0;
+const RIGHT_INITIAL_WIDTH: f64 = 260.0;
 const HANDLE_WIDTH: f64 = 10.0;
 
 /// Animation detection: track when resize burst started.
@@ -377,8 +376,8 @@ pub fn main_layout<L: IntoView + 'static, C: IntoView + 'static, R: IntoView + '
     right: R,
     theme: UiTheme,
 ) -> impl IntoView {
-    let left_width = RwSignal::new(LEFT_MIN_WIDTH);
-    let right_width = RwSignal::new(RIGHT_MIN_WIDTH);
+    let left_width = RwSignal::new(LEFT_INITIAL_WIDTH);
+    let right_width = RwSignal::new(RIGHT_INITIAL_WIDTH);
 
     let left = container(left).style(move |s| {
         s.width(left_width.get())
