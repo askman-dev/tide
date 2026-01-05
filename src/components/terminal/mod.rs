@@ -1,8 +1,36 @@
+mod colors;
+mod constants;
+mod instance;
+#[cfg(target_os = "macos")]
+mod panel;
+
 use crate::components::atoms::meta_text;
-use crate::model::WorkspaceTab;
+use crate::model::{TerminalPane, WorkspaceTab};
 use crate::services::TerminalSession;
-use crate::theme::{TerminalPalette, UiTheme};
+use crate::theme::UiTheme;
+
+#[cfg(target_os = "macos")]
+use crate::theme::TerminalPalette;
 use floem::prelude::*;
+use std::path::PathBuf;
+
+#[cfg(target_os = "macos")]
+use colors::{
+    TerminalColorList, background_brush, cursor_brush, resolve_bg_color, resolve_fg_color,
+};
+
+#[cfg(target_os = "macos")]
+use instance::TerminalInstanceState;
+
+#[cfg(target_os = "macos")]
+use panel::{SplitterDragState, calculate_splitter_drag, DRAG_STATE_SENTINEL};
+
+#[cfg(target_os = "macos")]
+use constants::{
+    CELL_PADDING, OVERLAY_MIN_VISIBLE_MS, OVERLAY_SHOW_DURATION_MS, PTY_RESIZE_DEBOUNCE_MS,
+    SPLITTER_WIDTH, SPLIT_SECOND_WAVE_MS, SPLIT_TRIGGER_DELAY_MS, TERMINAL_FONT_SIZE,
+    terminal_font_families,
+};
 
 #[cfg(target_os = "macos")]
 use crate::logging;
@@ -14,7 +42,6 @@ use alacritty_terminal::{
     selection::{Selection, SelectionType},
     term::{
         cell::Flags,
-        color::Colors as TermColors,
         point_to_viewport,
         viewport_to_point,
         RenderableContent,
@@ -27,13 +54,13 @@ use floem::{
     event::{Event, EventListener, EventPropagation},
     ext_event::{register_ext_trigger, ExtSendTrigger},
     keyboard::{Key, NamedKey},
+    menu::{Menu, MenuItem},
     peniko::{
         kurbo::Rect,
         Brush, Color,
     },
-    pointer::{PointerInputEvent, PointerMoveEvent, PointerButton, MouseButton},
     reactive::{create_effect, RwSignal},
-    text::{Attrs, AttrsList, FamilyOwned, TextLayout},
+    text::{Attrs, AttrsList, TextLayout},
 };
 
 #[cfg(target_os = "macos")]
@@ -43,36 +70,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
-use std::ops::{Index, IndexMut};
-
-#[cfg(target_os = "macos")]
 use std::sync::{Mutex, OnceLock};
 
 /// Global trigger for forcing terminal repaint from WindowResized events.
 /// This allows layout.rs to bypass the normal canvas paint flow during macOS animations.
 #[cfg(target_os = "macos")]
 static FORCE_REPAINT_TRIGGER: OnceLock<Mutex<Option<ExtSendTrigger>>> = OnceLock::new();
-
-/// Wrapper to make Weak<TerminalSession> Sync.
-/// Safety: Only accessed from main thread via GCD dispatch, and we only hold a Weak reference.
-#[cfg(target_os = "macos")]
-struct SendSyncSession(Option<std::sync::Weak<TerminalSession>>);
-
-#[cfg(target_os = "macos")]
-unsafe impl Send for SendSyncSession {}
-#[cfg(target_os = "macos")]
-unsafe impl Sync for SendSyncSession {}
-
-/// Global terminal session reference for direct resize from animation timer.
-/// This bypasses the floem event queue by allowing layout.rs to directly call resize.
-#[cfg(target_os = "macos")]
-static GLOBAL_TERMINAL_SESSION: OnceLock<Mutex<SendSyncSession>> = OnceLock::new();
-
-/// Global cached cell size for calculating grid dimensions without canvas access.
-#[cfg(target_os = "macos")]
-static CACHED_CELL_WIDTH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-#[cfg(target_os = "macos")]
-static CACHED_CELL_HEIGHT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Register a trigger that can be used to force terminal repaint from external code.
 #[cfg(target_os = "macos")]
@@ -83,34 +86,9 @@ pub fn register_force_repaint_trigger(trigger: ExtSendTrigger) {
     }
 }
 
-/// Register the terminal session globally for direct resize access.
-#[cfg(target_os = "macos")]
-pub fn register_terminal_session(session: &Arc<TerminalSession>) {
-    let mutex = GLOBAL_TERMINAL_SESSION.get_or_init(|| Mutex::new(SendSyncSession(None)));
-    if let Ok(mut guard) = mutex.lock() {
-        guard.0 = Some(Arc::downgrade(session));
-    }
-}
-
-/// Update the cached cell size for grid calculations.
-#[cfg(target_os = "macos")]
-pub fn update_cached_cell_size(width: f64, height: f64) {
-    use std::sync::atomic::Ordering;
-    CACHED_CELL_WIDTH.store(width.to_bits(), Ordering::SeqCst);
-    CACHED_CELL_HEIGHT.store(height.to_bits(), Ordering::SeqCst);
-}
-
-/// Get the cached cell size.
-#[cfg(target_os = "macos")]
-pub fn get_cached_cell_size() -> (f64, f64) {
-    use std::sync::atomic::Ordering;
-    let w = f64::from_bits(CACHED_CELL_WIDTH.load(Ordering::SeqCst));
-    let h = f64::from_bits(CACHED_CELL_HEIGHT.load(Ordering::SeqCst));
-    (w, h)
-}
-
 /// Force a terminal repaint by triggering the registered ExtSendTrigger.
-/// Called from layout.rs when animation is likely to have ended.
+/// Called from layout.rs when animation timer expires.
+/// Each terminal pane's canvas will recalculate its own grid size correctly.
 #[cfg(target_os = "macos")]
 pub fn force_terminal_repaint() {
     if let Some(mutex) = FORCE_REPAINT_TRIGGER.get() {
@@ -124,307 +102,6 @@ pub fn force_terminal_repaint() {
     }
 }
 
-/// Directly resize the terminal PTY, bypassing floem's event queue.
-/// Called from layout.rs animation timer via GCD dispatch.
-#[cfg(target_os = "macos")]
-pub fn direct_terminal_resize(window_width: f64, window_height: f64) {
-    let (cell_width, cell_height) = get_cached_cell_size();
-
-    if cell_width <= 0.0 || cell_height <= 0.0 {
-        logging::log_line("DEBUG", "direct_terminal_resize: no cached cell size yet");
-        // Fall back to triggering repaint
-        force_terminal_repaint();
-        return;
-    }
-
-    // Get the terminal session
-    let session_opt = GLOBAL_TERMINAL_SESSION.get().and_then(|mutex| {
-        mutex.lock().ok().and_then(|guard| {
-            guard.0.as_ref().and_then(|weak| weak.upgrade())
-        })
-    });
-
-    let Some(session) = session_opt else {
-        logging::log_line("DEBUG", "direct_terminal_resize: no session registered");
-        force_terminal_repaint();
-        return;
-    };
-
-    // Calculate grid size using the same logic as canvas paint
-    // Account for padding (8px on each side = 16px total) and layout overhead
-    // The terminal canvas is inside a Container with padding, and the center pane has flex layout
-    // We need to estimate the terminal canvas size from window size
-    // Left pane (200) + handle (10) + right pane (260) + handle (10) = 480
-    // Plus some padding = ~500px of non-terminal width
-    let terminal_canvas_width = (window_width - 500.0).max(300.0);
-    let terminal_canvas_height = (window_height - 80.0).max(200.0); // Tab bar + padding
-
-    let available_width = (terminal_canvas_width - 16.0).max(1.0);
-    let available_height = (terminal_canvas_height - 16.0).max(1.0);
-    let cols = (available_width / cell_width).floor().max(1.0) as u16;
-    let rows = (available_height / cell_height).floor().max(1.0) as u16;
-
-    logging::log_line(
-        "DEBUG",
-        &format!(
-            "direct_terminal_resize: window={:.0}x{:.0} canvas_est={:.0}x{:.0} cell={:.1}x{:.1} -> {}x{}",
-            window_width, window_height, terminal_canvas_width, terminal_canvas_height,
-            cell_width, cell_height, cols, rows
-        ),
-    );
-
-    if let Err(err) = session.resize(cols, rows) {
-        logging::log_line("ERROR", &format!("direct_terminal_resize failed: {err}"));
-    }
-
-    // Also trigger repaint to update the canvas
-    force_terminal_repaint();
-}
-
-/// Base font size for terminal cells.
-#[cfg(target_os = "macos")]
-const TERMINAL_FONT_SIZE: f32 = 13.0;
-
-#[cfg(target_os = "macos")]
-fn terminal_font_families() -> [FamilyOwned; 1] {
-    [
-        FamilyOwned::Name("Menlo".into()),
-    ]
-}
-
-#[cfg(target_os = "macos")]
-fn background_brush(theme: UiTheme) -> Brush {
-    Brush::from(theme.panel_bg)
-}
-
-#[cfg(target_os = "macos")]
-fn cursor_brush(theme: UiTheme) -> Brush {
-    Brush::from(theme.accent.with_alpha(0.7))
-}
-
-#[cfg(target_os = "macos")]
-fn ansi_rgb_to_color(rgb: alacritty_terminal::vte::ansi::Rgb) -> Color {
-    Color::from_rgb8(rgb.r, rgb.g, rgb.b)
-}
-
-#[cfg(target_os = "macos")]
-struct TerminalColorList([alacritty_terminal::vte::ansi::Rgb; alacritty_terminal::term::color::COUNT]);
-
-#[cfg(target_os = "macos")]
-impl TerminalColorList {
-    fn from_palette(palette: &TerminalPalette) -> Self {
-        use alacritty_terminal::term::color::COUNT;
-
-        let mut list = TerminalColorList([alacritty_terminal::vte::ansi::Rgb::default(); COUNT]);
-
-        list.fill_named(palette);
-        list.fill_cube();
-        list.fill_gray_ramp();
-
-        list
-    }
-
-    fn fill_named(&mut self, palette: &TerminalPalette) {
-        // Normal ANSI colors.
-        self[NamedColor::Black] = palette.normal[0];
-        self[NamedColor::Red] = palette.normal[1];
-        self[NamedColor::Green] = palette.normal[2];
-        self[NamedColor::Yellow] = palette.normal[3];
-        self[NamedColor::Blue] = palette.normal[4];
-        self[NamedColor::Magenta] = palette.normal[5];
-        self[NamedColor::Cyan] = palette.normal[6];
-        self[NamedColor::White] = palette.normal[7];
-
-        // Bright ANSI colors.
-        self[NamedColor::BrightBlack] = palette.bright[0];
-        self[NamedColor::BrightRed] = palette.bright[1];
-        self[NamedColor::BrightGreen] = palette.bright[2];
-        self[NamedColor::BrightYellow] = palette.bright[3];
-        self[NamedColor::BrightBlue] = palette.bright[4];
-        self[NamedColor::BrightMagenta] = palette.bright[5];
-        self[NamedColor::BrightCyan] = palette.bright[6];
-        self[NamedColor::BrightWhite] = palette.bright[7];
-
-        // Foreground and background.
-        self[NamedColor::Foreground] = palette.primary_foreground;
-        self[NamedColor::Background] = palette.primary_background;
-        self[NamedColor::BrightForeground] = palette.bright[7];
-
-        // Dimmed foreground and ANSI colors.
-        let dim_fg = {
-            let fg = palette.primary_foreground;
-            let r = (fg.r as f32 * 0.66) as u8;
-            let g = (fg.g as f32 * 0.66) as u8;
-            let b = (fg.b as f32 * 0.66) as u8;
-            alacritty_terminal::vte::ansi::Rgb { r, g, b }
-        };
-
-        self[NamedColor::DimForeground] = dim_fg;
-
-        self[NamedColor::DimBlack] = palette.dim[0];
-        self[NamedColor::DimRed] = palette.dim[1];
-        self[NamedColor::DimGreen] = palette.dim[2];
-        self[NamedColor::DimYellow] = palette.dim[3];
-        self[NamedColor::DimBlue] = palette.dim[4];
-        self[NamedColor::DimMagenta] = palette.dim[5];
-        self[NamedColor::DimCyan] = palette.dim[6];
-        self[NamedColor::DimWhite] = palette.dim[7];
-    }
-
-    fn fill_cube(&mut self) {
-        let mut index: usize = 16;
-
-        for r in 0..6 {
-            for g in 0..6 {
-                for b in 0..6 {
-                    let red = if r == 0 { 0 } else { r * 40 + 55 };
-                    let green = if g == 0 { 0 } else { g * 40 + 55 };
-                    let blue = if b == 0 { 0 } else { b * 40 + 55 };
-
-                    self.0[index] = alacritty_terminal::vte::ansi::Rgb {
-                        r: red,
-                        g: green,
-                        b: blue,
-                    };
-
-                    index += 1;
-                }
-            }
-        }
-
-        debug_assert!(index == 232);
-    }
-
-    fn fill_gray_ramp(&mut self) {
-        let mut index: usize = 232;
-
-        for i in 0..24 {
-            let value = i * 10 + 8;
-            self.0[index] = alacritty_terminal::vte::ansi::Rgb {
-                r: value,
-                g: value,
-                b: value,
-            };
-
-            index += 1;
-        }
-
-        debug_assert!(index == 256);
-    }
-
-    fn color_for_index(&self, index: usize, overrides: &TermColors) -> alacritty_terminal::vte::ansi::Rgb {
-        let clamped = index.min(self.0.len().saturating_sub(1));
-        overrides[clamped].unwrap_or(self.0[clamped])
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl Index<usize> for TerminalColorList {
-    type Output = alacritty_terminal::vte::ansi::Rgb;
-
-    fn index(&self, idx: usize) -> &Self::Output {
-        &self.0[idx]
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl IndexMut<usize> for TerminalColorList {
-    fn index_mut(&mut self, idx: usize) -> &mut Self::Output {
-        &mut self.0[idx]
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl Index<NamedColor> for TerminalColorList {
-    type Output = alacritty_terminal::vte::ansi::Rgb;
-
-    fn index(&self, idx: NamedColor) -> &Self::Output {
-        &self.0[idx as usize]
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl IndexMut<NamedColor> for TerminalColorList {
-    fn index_mut(&mut self, idx: NamedColor) -> &mut Self::Output {
-        &mut self.0[idx as usize]
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn resolve_fg_color(
-    overrides: &TermColors,
-    palette: &TerminalColorList,
-    color: &AnsiColor,
-    flags: Flags,
-) -> Color {
-    const DRAW_BOLD_TEXT_WITH_BRIGHT_COLORS: bool = true;
-    const DIM_FACTOR: f32 = 0.66;
-
-    let rgb = match *color {
-        AnsiColor::Spec(spec) => {
-            if (flags & Flags::DIM) == Flags::DIM {
-                let r = (spec.r as f32 * DIM_FACTOR) as u8;
-                let g = (spec.g as f32 * DIM_FACTOR) as u8;
-                let b = (spec.b as f32 * DIM_FACTOR) as u8;
-                alacritty_terminal::vte::ansi::Rgb { r, g, b }
-            } else {
-                spec
-            }
-        }
-        AnsiColor::Named(ansi) => {
-            let dim_bold = flags & Flags::DIM_BOLD;
-
-            if dim_bold == Flags::DIM_BOLD && ansi == NamedColor::Foreground {
-                palette.color_for_index(NamedColor::DimForeground as usize, overrides)
-            } else if DRAW_BOLD_TEXT_WITH_BRIGHT_COLORS && dim_bold == Flags::BOLD {
-                palette.color_for_index(ansi.to_bright() as usize, overrides)
-            } else if dim_bold == Flags::DIM
-                || (!DRAW_BOLD_TEXT_WITH_BRIGHT_COLORS && dim_bold == Flags::DIM_BOLD)
-            {
-                palette.color_for_index(ansi.to_dim() as usize, overrides)
-            } else {
-                palette.color_for_index(ansi as usize, overrides)
-            }
-        }
-        AnsiColor::Indexed(idx) => {
-            let dim_bold = flags & Flags::DIM_BOLD;
-            let mut palette_index = idx as usize;
-
-            match (DRAW_BOLD_TEXT_WITH_BRIGHT_COLORS, dim_bold, idx) {
-                (true, Flags::BOLD, 0..=7) => {
-                    palette_index = idx as usize + 8;
-                }
-                (false, Flags::DIM, 8..=15) => {
-                    palette_index = idx as usize - 8;
-                }
-                (false, Flags::DIM, 0..=7) => {
-                    palette_index = NamedColor::DimBlack as usize + idx as usize;
-                }
-                _ => {}
-            }
-
-            palette.color_for_index(palette_index, overrides)
-        }
-    };
-
-    ansi_rgb_to_color(rgb)
-}
-
-#[cfg(target_os = "macos")]
-fn resolve_bg_color(
-    overrides: &TermColors,
-    palette: &TerminalColorList,
-    color: &AnsiColor,
-) -> Color {
-    let rgb = match *color {
-        AnsiColor::Spec(spec) => spec,
-        AnsiColor::Named(ansi) => palette.color_for_index(ansi as usize, overrides),
-        AnsiColor::Indexed(idx) => palette.color_for_index(idx as usize, overrides),
-    };
-
-    ansi_rgb_to_color(rgb)
-}
-
 /// Platform-gated terminal view entry point.
 ///
 /// On macOS this hosts the real PTY-backed terminal backed by
@@ -432,35 +109,219 @@ fn resolve_bg_color(
 /// On non-macOS platforms it shows a simple placeholder message.
 #[cfg(target_os = "macos")]
 pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
-    let workspace_name = workspace.name;
-    let workspace_root = workspace.root.get(); // Get the PathBuf value from signal
+    use floem::style::CursorStyle;
 
-    let session = workspace.terminal;
-    let error_msg: RwSignal<Option<String>> = RwSignal::new(None);
-    let last_size: RwSignal<(u16, u16)> = RwSignal::new((0, 0));
-    let pending_size: RwSignal<(u16, u16)> = RwSignal::new((0, 0));
-    let last_resize_request: RwSignal<Instant> = RwSignal::new(Instant::now());
-    let resize_trigger = ExtSendTrigger::new();
+    let workspace_name = workspace.name;
+    let workspace_root = workspace.root;
+    let terminal_panes = workspace.terminal_panes;
+    let next_pane_id = workspace.next_pane_id;
+
+    // Track which pane is focused (for cursor visibility)
+    let focused_pane_id: RwSignal<Option<usize>> = RwSignal::new(None);
+
+    // Track splitter drag state at parent level (not inside dyn_stack)
+    // This prevents pane views from being rebuilt when drag state changes
+    let drag_state: RwSignal<SplitterDragState> = RwSignal::new(None);
+
+    // Use dyn_stack to preserve pane views when adding/removing panes
+    // Each pane includes a splitter on its right side (handled in pane view)
+    let panes_stack = dyn_stack(
+        move || terminal_panes.get(),
+        |pane| pane.id,
+        move |pane| {
+            let pane_id = pane.id;
+            let pane_flex_ratio = pane.flex_ratio;
+
+            // Check if this is the last pane (no splitter needed after it)
+            let is_last = move || {
+                let panes = terminal_panes.get();
+                panes.last().map_or(true, |last| last.id == pane_id)
+            };
+
+            let pane_view = terminal_pane_view(
+                theme,
+                pane.clone(),
+                workspace_root,
+                terminal_panes,
+                next_pane_id,
+                focused_pane_id,
+            );
+
+            // Splitter element (only visible if not last pane)
+            let splitter = container(empty())
+                .style(move |s| {
+                    let show = !is_last();
+                    let is_dragging = drag_state.get().map_or(false, |(id, _)| id == pane_id);
+                    s.display(if show { floem::style::Display::Flex } else { floem::style::Display::None })
+                        .width(SPLITTER_WIDTH)
+                        .height_full()
+                        .background(if is_dragging { theme.accent } else { theme.border_subtle })
+                        .cursor(CursorStyle::ColResize)
+                        .hover(|s| s.background(theme.accent.with_alpha(0.5)))
+                })
+                .on_event(EventListener::PointerDown, move |event| {
+                    if let Event::PointerDown(pointer_event) = event {
+                        if pointer_event.button.is_primary() {
+                            // Check that there's a next pane to resize with
+                            let panes = terminal_panes.get_untracked();
+                            let idx = panes.iter().position(|p| p.id == pane_id);
+
+                            if let Some(i) = idx {
+                                if panes.get(i + 1).is_some() {
+                                    // Use sentinel to indicate first move hasn't happened yet
+                                    drag_state.set(Some((pane_id, DRAG_STATE_SENTINEL)));
+                                    logging::breadcrumb(format!("splitter drag start: pane {pane_id}"));
+                                    return EventPropagation::Stop;
+                                }
+                            }
+                        }
+                    }
+                    EventPropagation::Continue
+                });
+
+            // Combine pane and splitter in a horizontal stack
+            h_stack((pane_view, splitter))
+                .style(move |s| {
+                    let flex = pane_flex_ratio.get();
+                    s.flex_basis(0.0).flex_grow(flex as f32).height_full()
+                })
+        },
+    )
+    .style(|s| s.flex_row().width_full().height_full());
+
+    // Capture the panes_stack ViewId so we can get its width during drag
+    let panes_stack_id = panes_stack.id();
+
+    // Add event handlers for drag
+    let panes_stack = panes_stack
+        .on_event(EventListener::PointerMove, move |event| {
+            if let Event::PointerMove(pointer_event) = event {
+                if let Some((left_pane_id, last_x)) = drag_state.get_untracked() {
+                    let current_x = pointer_event.pos.x;
+
+                    // First move after PointerDown: just record position, don't resize yet
+                    if last_x == DRAG_STATE_SENTINEL {
+                        drag_state.set(Some((left_pane_id, current_x)));
+                        return EventPropagation::Stop;
+                    }
+
+                    // Calculate incremental delta (same coordinate system)
+                    let delta_x = current_x - last_x;
+
+                    // Update last_x for next move
+                    drag_state.set(Some((left_pane_id, current_x)));
+
+                    let panes = terminal_panes.get_untracked();
+                    if let Some(idx) = panes.iter().position(|p| p.id == left_pane_id) {
+                        if let Some(right_pane) = panes.get(idx + 1) {
+                            let left_ratio = panes[idx].flex_ratio.get_untracked();
+                            let right_ratio = right_pane.flex_ratio.get_untracked();
+
+                            // Get actual container width for accurate sensitivity
+                            let container_rect = panes_stack_id.layout_rect();
+                            let container_width = container_rect.width();
+
+                            // Use panel helper for drag calculation
+                            if let Some((new_left, new_right)) = calculate_splitter_drag(
+                                delta_x,
+                                left_ratio,
+                                right_ratio,
+                                container_width,
+                            ) {
+                                panes[idx].flex_ratio.set(new_left);
+                                right_pane.flex_ratio.set(new_right);
+                            }
+                        }
+                    }
+
+                    return EventPropagation::Stop;
+                }
+            }
+            EventPropagation::Continue
+        })
+        .on_event(EventListener::PointerUp, move |_| {
+            if drag_state.get_untracked().is_some() {
+                logging::breadcrumb("splitter drag end".to_string());
+                drag_state.set(None);
+                // Collect triggers before spawning thread (RwSignal is not Send)
+                let triggers: Vec<_> = terminal_panes.get_untracked()
+                    .iter()
+                    .map(|p| p.trigger.clone())
+                    .collect();
+                // Delay trigger to allow layout to settle after drag ends
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(PTY_RESIZE_DEBOUNCE_MS));
+                    for trigger in triggers {
+                        register_ext_trigger(trigger);
+                    }
+                });
+                return EventPropagation::Stop;
+            }
+            EventPropagation::Continue
+        });
+
+    v_stack((
+        label(|| "Terminal").style(move |s| {
+            s.font_size(12.0)
+                .font_bold()
+                .color(theme.text_muted)
+        }),
+        meta_text(format!("Workspace: {}", workspace_name.get()), theme),
+        container(panes_stack).style(move |s| {
+            s.width_full()
+                .flex_grow(1.0)  // Fill remaining height
+                .padding(8.0)
+                .background(theme.panel_bg)
+                .border(1.0)
+                .border_color(theme.border_subtle)
+        }),
+    ))
+    .style(|s| s.width_full().height_full().row_gap(8.0))
+}
+
+
+/// Render a single terminal pane
+#[cfg(target_os = "macos")]
+fn terminal_pane_view(
+    theme: UiTheme,
+    pane: TerminalPane,
+    workspace_root: RwSignal<PathBuf>,
+    terminal_panes: RwSignal<Vec<TerminalPane>>,
+    next_pane_id: RwSignal<usize>,
+    focused_pane_id: RwSignal<Option<usize>>,
+) -> impl IntoView {
+    let session = pane.session;
+    let term_update_trigger = pane.trigger;
+    let pane_id = pane.id;
+
+    // Bundle all instance state signals
+    let state = TerminalInstanceState::new();
+
+    // Create local bindings for frequently used signals (avoids repetitive `state.` prefix)
+    let error_msg = state.error_msg;
+    let last_size = state.last_size;
+    let pending_size = state.pending_size;
+    let last_resize_request = state.last_resize_request;
+    let resize_trigger = state.resize_trigger.clone();
+    let cell_size = state.cell_size;
+    let cell_y_offset = state.cell_y_offset;
+    let last_pty_resize_at = state.last_pty_resize_at;
+    let ime_focused = state.ime_focused;
+    let ime_update_tick = state.ime_update_tick;
+    let last_ime_cursor_area = state.last_ime_cursor_area;
+    let last_canvas_size = state.last_canvas_size;
+    let scroll_accumulator = state.scroll_accumulator;
+    let resize_overlay_visible = state.resize_overlay_visible;
+    let resize_overlay_text = state.resize_overlay_text;
+    let overlay_show_time = state.overlay_show_time;
+    let overlay_hide_trigger = state.overlay_hide_trigger.clone();
 
     // Register the resize trigger globally so layout.rs can force repaint after animation
     register_force_repaint_trigger(resize_trigger.clone());
 
-    let cell_size: RwSignal<(f64, f64)> = RwSignal::new((0.0, 0.0));
-    let cell_y_offset: RwSignal<f64> = RwSignal::new(0.0);
-    let last_pty_resize_at: RwSignal<Instant> = RwSignal::new(Instant::now());
-    let ime_focused: RwSignal<bool> = RwSignal::new(false);
-    let ime_update_tick: RwSignal<u64> = RwSignal::new(0);
-    let last_ime_cursor_area: RwSignal<Option<(floem::kurbo::Point, floem::kurbo::Size)>> =
-        RwSignal::new(None);
-    let last_canvas_size: RwSignal<(f64, f64)> = RwSignal::new((0.0, 0.0));
-    // Scroll accumulator for smooth touchpad scrolling (accumulates sub-line deltas)
-    let scroll_accumulator: RwSignal<f64> = RwSignal::new(0.0);
-    // Trigger repaints when terminal content changes (from background thread).
-    let term_update_trigger = workspace.terminal_trigger;
-
     let terminal_canvas = canvas({
-        let workspace_root = workspace_root.clone();
         move |cx, size| {
+            let workspace_root = workspace_root.get_untracked();
             let font_families = terminal_font_families();
             let render_start = Instant::now();
             let mut rendered_cells: usize = 0;
@@ -498,8 +359,6 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
 
                 match TerminalSession::new(&workspace_root, notify) {
                     Ok(new_session) => {
-                        // Register session globally for direct resize access
-                        register_terminal_session(&new_session);
                         current_session = Some(new_session.clone());
                         session.set(Some(new_session));
                     }
@@ -541,8 +400,6 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
                 cell_size.set((cell_width, cell_height));
                 cell_y_offset.set((cell_height - metrics_size.height) / 2.0);
                 last_canvas_size.set((size.width, size.height));
-                // Update global cache for direct resize from animation timer
-                update_cached_cell_size(cell_width, cell_height);
             }
 
             let y_offset = cell_y_offset.get_untracked();
@@ -558,22 +415,38 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
             let (last_cols, last_rows) = last_size.get_untracked();
             let size_changed = cols != last_cols || rows != last_rows;
 
+            // DEBUG: Log canvas size on every paint to diagnose resize issues
+            logging::log_line(
+                "DEBUG",
+                &format!(
+                    "[Pane {}] canvas paint: {:.0}x{:.0}px -> {}x{} grid (was {}x{}) changed={}",
+                    pane_id, size.width, size.height, cols, rows, last_cols, last_rows, size_changed
+                ),
+            );
+
             if size_changed {
-                // Update pending size for debounced PTY resize
-                pending_size.set((cols, rows));
-                last_resize_request.set(Instant::now());
+                // Only update pending_size and spawn timer if the pending size is actually changing
+                // This prevents debounce race condition where repeated paints keep resetting last_resize_request
+                let (pending_cols, pending_rows) = pending_size.get_untracked();
+                let pending_changed = pending_cols != cols || pending_rows != rows;
 
-                logging::breadcrumb(format!(
-                    "grid size changed: {}x{} -> {}x{} (canvas {:.0}x{:.0})",
-                    last_cols, last_rows, cols, rows, size.width, size.height
-                ));
+                if pending_changed {
+                    pending_size.set((cols, rows));
+                    last_resize_request.set(Instant::now());
 
-                // Spawn a timer to trigger PTY resize later (debounce)
-                let trigger = resize_trigger.clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(Duration::from_millis(30));
-                    register_ext_trigger(trigger);
-                });
+                    logging::breadcrumb(format!(
+                        "grid size changed: {}x{} -> {}x{} (canvas {:.0}x{:.0})",
+                        last_cols, last_rows, cols, rows, size.width, size.height
+                    ));
+
+                    // Spawn a timer to trigger PTY resize later (debounce)
+                    // Wait 60ms to ensure debounce check (50ms) passes
+                    let trigger = resize_trigger.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(60));
+                        register_ext_trigger(trigger);
+                    });
+                }
             }
 
             // Always render with current calculated size (not last_size)
@@ -584,6 +457,19 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
             let palette_list = TerminalColorList::from_palette(&palette);
 
             session.with_term(|term| {
+                // DEBUG: Log PTY's actual grid size vs canvas calculated size
+                let pty_cols = term.columns();
+                let pty_rows = term.screen_lines();
+                if pty_cols != cols as usize || pty_rows != rows as usize {
+                    logging::log_line(
+                        "WARN",
+                        &format!(
+                            "[Pane {}] MISMATCH: PTY={}x{} vs Canvas={}x{}",
+                            pane_id, pty_cols, pty_rows, cols, rows
+                        ),
+                    );
+                }
+
                 let mut content: RenderableContent<'_> = term.renderable_content();
                 let selection = content.selection;
                 let cursor = content.cursor;
@@ -603,10 +489,13 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
 
                     let col = viewport_point.column.0 as f64;
                     let row = viewport_point.line as f64;
-                    let x = col * cell_width;
-                    let y = row * cell_height;
+                    // Add padding offset
+                    let x = CELL_PADDING + col * cell_width;
+                    let y = CELL_PADDING + row * cell_height;
 
-                    if x >= size.width || y >= size.height {
+                    // Skip cells outside the available area (accounting for padding)
+                    // Use small tolerance (1.0) to avoid floating point precision issues cutting off last row
+                    if x + cell_width > size.width - (CELL_PADDING - 1.0) || y + cell_height > size.height - (CELL_PADDING - 1.0) {
                         continue;
                     }
 
@@ -699,15 +588,17 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
                     }
                 }
 
-                // Cursor
-                if cursor.shape != AnsiCursorShape::Hidden && session.is_active() {
+                // Cursor - only show on focused pane
+                let is_focused = focused_pane_id.get_untracked() == Some(pane_id);
+                if cursor.shape != AnsiCursorShape::Hidden && session.is_active() && is_focused {
                     if let Some(viewport_cursor) =
                         point_to_viewport(content.display_offset, cursor.point)
                     {
                         let col = viewport_cursor.column.0 as f64;
                         let row = viewport_cursor.line as f64;
-                        let x = col * cell_width;
-                        let y = row * cell_height;
+                        // Add padding offset
+                        let x = CELL_PADDING + col * cell_width;
+                        let y = CELL_PADDING + row * cell_height;
                         let cursor_rect = Rect::new(x, y, x + cell_width, y + cell_height);
                         let brush = cursor_brush(theme);
                         cx.fill(&cursor_rect, &brush, 0.0);
@@ -769,11 +660,14 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
     // Custom update to track window_origin
     let terminal_wrapper_id = terminal_wrapper.id();
     
-    // Effect to trigger repaint when session/error state changes
+    // Effect to trigger repaint when session/error state or focus changes
     create_effect(move |_| {
         session.track();
         error_msg.track();
         term_update_trigger.track();
+        focused_pane_id.track();  // Repaint when focus changes to show/hide cursor
+        // Request layout first so canvas can detect new size, then repaint
+        canvas_id.request_layout();
         canvas_id.request_paint();
     });
 
@@ -849,31 +743,45 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
         let (pending_cols, pending_rows) = pending_size.get_untracked();
         let (last_cols, last_rows) = last_size.get_untracked();
 
+        // DEBUG: Log effect entry
+        logging::log_line(
+            "DEBUG",
+            &format!(
+                "[Pane {}] resize effect: pending={}x{} last={}x{}",
+                pane_id, pending_cols, pending_rows, last_cols, last_rows
+            ),
+        );
+
         if pending_cols == 0 || pending_rows == 0 {
+            logging::log_line("DEBUG", &format!("[Pane {}] resize effect: SKIP (pending is zero)", pane_id));
             return;
         }
 
         // If nothing changed, don't bother
         if pending_cols == last_cols && pending_rows == last_rows {
+            logging::log_line("DEBUG", &format!("[Pane {}] resize effect: SKIP (no change)", pane_id));
             return;
         }
 
         // Debounce check
         let last_request = last_resize_request.get_untracked();
         let debounce_wait = last_request.elapsed();
-        if debounce_wait < Duration::from_millis(50) {
-            logging::breadcrumb(format!(
-                "resize effect: debounce skip (waited {}ms)",
-                debounce_wait.as_millis()
-            ));
+        if debounce_wait < Duration::from_millis(PTY_RESIZE_DEBOUNCE_MS) {
+            logging::log_line(
+                "DEBUG",
+                &format!(
+                    "[Pane {}] resize effect: SKIP debounce (waited {}ms < {}ms)",
+                    pane_id, debounce_wait.as_millis(), PTY_RESIZE_DEBOUNCE_MS
+                ),
+            );
             return;
         }
 
         logging::log_line(
             "DEBUG",
             &format!(
-                "resize effect triggered: {}x{} -> {}x{} (debounce waited {}ms)",
-                last_cols, last_rows, pending_cols, pending_rows, debounce_wait.as_millis()
+                "[Pane {}] resize effect: EXECUTING {}x{} -> {}x{} (waited {}ms)",
+                pane_id, last_cols, last_rows, pending_cols, pending_rows, debounce_wait.as_millis()
             ),
         );
 
@@ -899,7 +807,35 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
                         pending_cols, pending_rows, last_cols, last_rows, resize_ms, effect_ms
                     ),
                 );
+
+                // Show grid size overlay (like Ghostty)
+                let overlay_text = format!("{} x {}", pending_cols, pending_rows);
+                logging::log_line("INFO", &format!(
+                    "Pane {}: showing overlay '{}' (was {}x{})",
+                    pane_id, overlay_text, last_cols, last_rows
+                ));
+                resize_overlay_text.set(overlay_text);
+                resize_overlay_visible.set(true);
+                overlay_show_time.set(Instant::now());
+
+                // Hide overlay after timeout (unless another resize happens)
+                let hide_trigger = overlay_hide_trigger.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(OVERLAY_SHOW_DURATION_MS));
+                    register_ext_trigger(hide_trigger);
+                });
             }
+        }
+    });
+
+    // Effect to hide overlay when triggered (only if minimum visible time has passed)
+    create_effect(move |_| {
+        overlay_hide_trigger.track();
+        let show_time = overlay_show_time.get_untracked();
+        // Only hide if minimum visible time has passed since last show
+        // This prevents premature hiding when multiple resize events happen
+        if show_time.elapsed() >= std::time::Duration::from_millis(OVERLAY_MIN_VISIBLE_MS) {
+            resize_overlay_visible.set(false);
         }
     });
 
@@ -917,16 +853,21 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
             canvas_id.request_paint();
         })
         .on_event(EventListener::FocusGained, move |_| {
-            logging::breadcrumb("terminal focus gained".to_string());
+            logging::breadcrumb(format!("terminal pane {} focus gained", pane_id));
             ime_focused.set(true);
             ime_update_tick.update(|tick| *tick = tick.wrapping_add(1));
             floem::action::set_ime_allowed(true);
+            focused_pane_id.set(Some(pane_id));
             EventPropagation::Continue
         })
         .on_event(EventListener::FocusLost, move |_| {
-            logging::breadcrumb("terminal focus lost".to_string());
+            logging::breadcrumb(format!("terminal pane {} focus lost", pane_id));
             ime_focused.set(false);
             floem::action::set_ime_allowed(false);
+            // Only clear if we were the focused pane
+            if focused_pane_id.get_untracked() == Some(pane_id) {
+                focused_pane_id.set(None);
+            }
             EventPropagation::Continue
         })
         .on_event_cont(EventListener::ImePreedit, move |_| {
@@ -1023,6 +964,33 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
                                 }
 
                                 return EventPropagation::Stop;
+                            }
+                        }
+                    }
+
+                    // Handle Ctrl+key for control characters (Ctrl+C=0x03, Ctrl+Z=0x1A, etc.)
+                    if modifiers.control() {
+                        if let Key::Character(ch) = key {
+                            // Get first char and convert to control code
+                            if let Some(c) = ch.chars().next() {
+                                let upper = c.to_ascii_uppercase();
+                                if upper >= 'A' && upper <= 'Z' {
+                                    let ctrl_code = (upper as u8) - b'A' + 1;
+                                    logging::breadcrumb(format!(
+                                        "terminal ctrl+{}: sending 0x{:02x}",
+                                        c, ctrl_code
+                                    ));
+                                    if let Err(err) = session.write(&[ctrl_code]) {
+                                        crate::logging::log_line(
+                                            "ERROR",
+                                            &format!(
+                                                "Terminal write failed for Ctrl+{}: {err}",
+                                                c
+                                            ),
+                                        );
+                                    }
+                                    return EventPropagation::Stop;
+                                }
                             }
                         }
                     }
@@ -1125,6 +1093,7 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
 
                 if let Event::PointerWheel(wheel_event) = event {
                     let dy = wheel_event.delta.y;
+                    logging::log_line("DEBUG", &format!("[Pane {}] scroll event: dy={:.1}", pane_id, dy));
 
                     // Accumulate scroll delta for smooth touchpad scrolling
                     // Small gestures build up until they reach a full line
@@ -1140,7 +1109,7 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
 
                         // Negate: scrolling up (negative dy) should show earlier content (positive delta)
                         let scroll_delta = -lines;
-                        logging::breadcrumb(format!("terminal scroll: dy={dy:.1} acc={accumulated:.1} lines={scroll_delta}"));
+                        logging::log_line("DEBUG", &format!("[Pane {}] scroll execute: lines={} delta={}", pane_id, lines, scroll_delta));
                         session.scroll_display(scroll_delta);
                         canvas_id.request_paint();
                     } else {
@@ -1311,25 +1280,197 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
                 }
                 EventPropagation::Continue
             })
+        })
+        .context_menu(move || {
+            let session_for_reset = session.clone();
+            let error_msg_for_reset = error_msg;
+
+            // Check if there's a selection to show copy option
+            let has_selection = session.get_untracked().map_or(false, |sess| {
+                sess.with_term(|term| term.selection_to_string().is_some())
+            });
+
+            let mut menu = Menu::new("");
+
+            // Only show Copy if there's a selection
+            if has_selection {
+                let session_for_copy = session.get_untracked();
+                menu = menu.entry(MenuItem::new("复制").action(move || {
+                    if let Some(ref sess) = session_for_copy {
+                        if let Some(text) = sess.with_term(|term| term.selection_to_string()) {
+                            crate::services::set_clipboard_string(&text);
+                            logging::log_line("INFO", "Terminal: copied selection to clipboard");
+                        }
+                    }
+                }));
+            }
+
+            menu = menu.entry(MenuItem::new("粘贴").action(move || {
+                if let Some(sess) = session.get_untracked() {
+                    if let Some(text) = crate::services::get_clipboard_string() {
+                        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+                        if !normalized.is_empty() {
+                            if let Err(err) = sess.write(normalized.as_bytes()) {
+                                logging::log_line("ERROR", &format!("Terminal paste failed: {err}"));
+                            }
+                        }
+                    }
+                }
+            }));
+
+            // Split actions
+            menu = menu
+                .separator()
+                .entry(MenuItem::new("向右分割").action(move || {
+                    logging::log_line("INFO", &format!("Terminal: Split right from pane {pane_id}"));
+                    let new_id = next_pane_id.get();
+                    next_pane_id.set(new_id + 1);
+
+                    let new_pane = TerminalPane {
+                        id: new_id,
+                        session: RwSignal::new(None),
+                        trigger: floem::ext_event::ExtSendTrigger::new(),
+                        flex_ratio: RwSignal::new(1.0),
+                    };
+
+                    terminal_panes.update(|panes| {
+                        // Find current pane index and insert after it
+                        if let Some(idx) = panes.iter().position(|p| p.id == pane_id) {
+                            panes.insert(idx + 1, new_pane);
+                        } else {
+                            panes.push(new_pane);
+                        }
+                    });
+                    // Collect triggers before spawning thread (RwSignal is not Send)
+                    let triggers: Vec<_> = terminal_panes.get_untracked()
+                        .iter()
+                        .map(|p| (p.id, p.trigger.clone()))
+                        .collect();
+                    let pane_count = triggers.len();
+                    // Delay trigger to allow layout to recalculate after pane list changes
+                    std::thread::spawn(move || {
+                        logging::log_line(
+                            "DEBUG",
+                            &format!("[Split Right] triggering {} panes after {}ms delay", pane_count, SPLIT_TRIGGER_DELAY_MS),
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(SPLIT_TRIGGER_DELAY_MS));
+                        for (id, trigger) in triggers.iter() {
+                            logging::log_line("DEBUG", &format!("[Split Right] trigger pane {}", id));
+                            register_ext_trigger(trigger.clone());
+                        }
+                        // Second wave trigger to ensure layout is complete
+                        logging::log_line("DEBUG", &format!("[Split Right] second wave after {}ms", SPLIT_SECOND_WAVE_MS));
+                        std::thread::sleep(std::time::Duration::from_millis(SPLIT_SECOND_WAVE_MS));
+                        for (id, trigger) in triggers.iter() {
+                            logging::log_line("DEBUG", &format!("[Split Right] trigger pane {} (2nd)", id));
+                            register_ext_trigger(trigger.clone());
+                        }
+                    });
+                }))
+                .entry(MenuItem::new("向左分割").action(move || {
+                    logging::log_line("INFO", &format!("Terminal: Split left from pane {pane_id}"));
+                    let new_id = next_pane_id.get();
+                    next_pane_id.set(new_id + 1);
+
+                    let new_pane = TerminalPane {
+                        id: new_id,
+                        session: RwSignal::new(None),
+                        trigger: floem::ext_event::ExtSendTrigger::new(),
+                        flex_ratio: RwSignal::new(1.0),
+                    };
+
+                    terminal_panes.update(|panes| {
+                        // Find current pane index and insert before it
+                        if let Some(idx) = panes.iter().position(|p| p.id == pane_id) {
+                            panes.insert(idx, new_pane);
+                        } else {
+                            panes.insert(0, new_pane);
+                        }
+                    });
+                    // Collect triggers before spawning thread (RwSignal is not Send)
+                    let triggers: Vec<_> = terminal_panes.get_untracked()
+                        .iter()
+                        .map(|p| (p.id, p.trigger.clone()))
+                        .collect();
+                    let pane_count = triggers.len();
+                    // Delay trigger to allow layout to recalculate after pane list changes
+                    std::thread::spawn(move || {
+                        logging::log_line("DEBUG", &format!(
+                            "[Split Left] triggering {} panes after {}ms delay",
+                            pane_count, SPLIT_TRIGGER_DELAY_MS
+                        ));
+                        std::thread::sleep(std::time::Duration::from_millis(SPLIT_TRIGGER_DELAY_MS));
+                        for (id, trigger) in triggers.iter() {
+                            logging::log_line("DEBUG", &format!("[Split Left] trigger pane {}", id));
+                            register_ext_trigger(trigger.clone());
+                        }
+                        // Second wave trigger to ensure layout is complete
+                        logging::log_line("DEBUG", &format!("[Split Left] second wave after {}ms", SPLIT_SECOND_WAVE_MS));
+                        std::thread::sleep(std::time::Duration::from_millis(SPLIT_SECOND_WAVE_MS));
+                        for (id, trigger) in triggers.iter() {
+                            logging::log_line("DEBUG", &format!("[Split Left] trigger pane {} (2nd)", id));
+                            register_ext_trigger(trigger.clone());
+                        }
+                    });
+                }));
+
+            menu = menu
+                .separator()
+                .entry(MenuItem::new("重置终端").action(move || {
+                    logging::log_line("INFO", "Terminal: Reset requested");
+                    session_for_reset.set(None);
+                    error_msg_for_reset.set(None);
+                }));
+
+            menu
         });
 
-    v_stack((
-        label(|| "Terminal").style(move |s| {
-            s.font_size(12.0)
-                .font_bold()
-                .color(theme.text_muted)
-        }),
-        meta_text(format!("Workspace: {}", workspace_name.get()), theme),
-        container(terminal_wrapper).style(move |s| {
-            s.width_full()
-                .height_full()
-                .padding(8.0)
-                .background(theme.panel_bg)
-                .border(1.0)
-                .border_color(theme.border_subtle)
-        }),
+    // Grid size overlay (centered, shows during resize)
+    // Use dyn_container to conditionally show/hide overlay with proper event handling
+    let grid_overlay = dyn_container(
+        move || resize_overlay_visible.get(),
+        move |visible| {
+            if visible {
+                let text = resize_overlay_text.get();
+                logging::breadcrumb(format!("Pane {}: overlay visible with text '{}'", pane_id, text));
+                // Overlay container: absolute + full size + centered content
+                container(
+                    container(label(move || text.clone()).style(move |s| {
+                        s.font_size(18.0)
+                            .font_bold()
+                            .color(theme.text)
+                            .padding(12.0)
+                            .padding_horiz(20.0)
+                    }))
+                    .style(move |s| {
+                        s.background(theme.panel_bg.with_alpha(0.95))
+                            .border_radius(8.0)
+                            .border(1.0)
+                            .border_color(theme.accent)
+                    })
+                )
+                .style(|s| {
+                    s.absolute()
+                        .inset(0.0)
+                        .items_center()
+                        .justify_center()
+                        .pointer_events_none()  // Don't block input to terminal
+                })
+                .into_any()
+            } else {
+                // When not visible, return empty with no size to avoid blocking input
+                empty().style(|s| s.display(floem::style::Display::None)).into_any()
+            }
+        },
+    )
+    .style(|s| s.z_index(100));
+
+    // Return terminal wrapper with overlay on top
+    stack((
+        terminal_wrapper.style(|s| s.flex_grow(1.0).height_full()),
+        grid_overlay,
     ))
-    .style(|s| s.width_full().height_full().row_gap(8.0))
+    .style(|s| s.flex_grow(1.0).height_full())
 }
 
 #[cfg(not(target_os = "macos"))]

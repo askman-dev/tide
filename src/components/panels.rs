@@ -54,10 +54,12 @@ pub fn collapsible_panel_view<V: IntoView + 'static>(
             let mut style = s.width_full().background(theme.panel_bg);
             if expanded.get() {
                 // When expanded: take available space, allow internal scroll
+                // flex_basis(0) ensures content height is IGNORED in flex calculations
                 style = style
                     .flex_grow(1.0)
                     .flex_shrink(1.0)
-                    .min_height(0.0) // Critical: allows shrinking below content height
+                    .flex_basis(0)  // Ignore content height
+                    .min_height(0)  // Allow shrinking to 0
                     .set(OverflowX, floem::taffy::Overflow::Hidden); // No horizontal scroll
             } else {
                 // When collapsed: completely hidden
@@ -74,11 +76,14 @@ pub fn collapsible_panel_view<V: IntoView + 'static>(
         use crate::theme::HEADER_HEIGHT;
         use floem::style::OverflowY;
         if expanded.get() {
-            // Expanded: participate in flex layout, can grow and shrink
-            // min_height ensures header is always visible (28px header + some content)
+            // Expanded: use flex_basis(0) pattern to IGNORE content height
+            // This is CSS "flex: 1 1 0" - distributes space purely by flex-grow
+            // Without flex_basis(0), content height affects flex calculations
+            // which causes sibling panels (terminal) to resize unexpectedly
             s.width_full()
                 .flex_grow(1.0)
                 .flex_shrink(1.0)
+                .flex_basis(0)  // Critical: ignore content height in flex calculations
                 .min_height(HEADER_HEIGHT + 20.0) // At least header + some content visible
                 .set(OverflowY, floem::taffy::Overflow::Hidden) // Prevent overflow
                 .background(theme.panel_bg)

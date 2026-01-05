@@ -1,6 +1,6 @@
 use crate::theme::UiTheme;
 use crate::logging;
-use crate::components::terminal::direct_terminal_resize;
+use crate::components::terminal::force_terminal_repaint;
 use floem::context::EventCx;
 use floem::event::{Event, EventPropagation};
 use floem::WindowIdExt;
@@ -70,13 +70,12 @@ fn start_animation_timer() {
             let (window_w, window_h) = get_last_window_size();
 
             logging::log_line("DEBUG", &format!(
-                "animation timer: 1.2s elapsed, executing resize directly for {:.0}x{:.0}",
+                "animation timer: 1.2s elapsed, triggering repaint for {:.0}x{:.0}",
                 window_w, window_h
             ));
 
-            // Execute resize directly on this background thread
-            // PTY resize and term.lock() are thread-safe
-            direct_terminal_resize(window_w, window_h);
+            // Trigger repaint - each pane's canvas will recalculate its own correct grid size
+            force_terminal_repaint();
 
             ANIMATION_TIMER_ACTIVE.store(false, Ordering::SeqCst);
         });
@@ -386,7 +385,6 @@ pub fn main_layout<L: IntoView + 'static, C: IntoView + 'static, R: IntoView + '
             .min_width(LEFT_MIN_WIDTH)
             .height_full()
             .background(theme.panel_bg)
-            // Contain overflow to prevent content from affecting parent layout
             .set(OverflowX, floem::taffy::Overflow::Hidden)
             .set(OverflowY, floem::taffy::Overflow::Hidden)
     });

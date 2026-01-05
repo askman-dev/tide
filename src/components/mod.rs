@@ -11,5 +11,3 @@ pub use panels::{collapsible_panel_view, file_tree_view, git_status_view, panel_
 pub use terminal::terminal_view;
 #[cfg(target_os = "macos")]
 pub use terminal::force_terminal_repaint;
-#[cfg(target_os = "macos")]
-pub use terminal::direct_terminal_resize;

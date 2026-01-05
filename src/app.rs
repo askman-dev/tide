@@ -2,7 +2,7 @@ use crate::components::{
     app_shell, collapsible_panel_view, file_tree_view, git_status_view, main_layout, tab_bar,
     tab_button, tab_button_with_menu, terminal_view, FILE, FOLDER, GIT,
 };
-use crate::model::WorkspaceTab;
+use crate::model::{TerminalPane, WorkspaceTab};
 use crate::services::{build_tree_entries, git_status_entries};
 use crate::theme::UiTheme;
 use floem::ext_event::{register_ext_trigger, ExtSendTrigger};
@@ -478,13 +478,21 @@ fn build_tab(id: usize, root: PathBuf) -> WorkspaceTab {
     let file_tree = build_tree_entries(&root, 3);
     let git_status = git_status_entries(&root);
 
+    // Create initial terminal pane
+    let initial_pane = TerminalPane {
+        id: 0,
+        session: RwSignal::new(None),
+        trigger: ExtSendTrigger::new(),
+        flex_ratio: RwSignal::new(1.0),
+    };
+
     WorkspaceTab {
         id,
         name: RwSignal::new(name),
         root: RwSignal::new(root),
         file_tree: RwSignal::new(file_tree),
         git_status: RwSignal::new(git_status),
-        terminal: RwSignal::new(None),
-        terminal_trigger: ExtSendTrigger::new(),
+        terminal_panes: RwSignal::new(vec![initial_pane]),
+        next_pane_id: RwSignal::new(1),
     }
 }
