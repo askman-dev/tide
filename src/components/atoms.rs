@@ -82,7 +82,9 @@ pub fn collapsible_panel_header(
         expanded.update(|v| *v = !*v);
     })
     .style(move |s| {
-        s.height(HEADER_HEIGHT)
+        s.width_full()
+            .height(HEADER_HEIGHT)
+            .flex_shrink(0.0) // Prevent header from shrinking when scrollbar appears
             .items_center()
             .padding_left(10.0)
             .col_gap(6.0)
