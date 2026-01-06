@@ -127,10 +127,10 @@ src/
      - resize_overlay_visible (RwSignal<bool>) controls visibility, resize_overlay_text (RwSignal<String>) stores "80 x 24" format
      - Overlay rendered via dyn_container checking resize_overlay_visible signal
      - Visual style: Font size 18.0 (increased from 14.0 for better visibility), theme.text color with theme.accent border (1.0px), semi-transparent background (theme.panel_bg @ 95% opacity), border_radius(8.0)
-     - Positioning: Uses absolute() + inset_left_pct(50.0) + inset_top_pct(50.0) + margin_left/top offsets for centering (only on inner container when visible)
-     - Event handling fix: Outer dyn_container has NO inset positioning, only z_index(100) - prevents blocking terminal input when overlay hidden
-     - Empty state: Returns empty().style(|s| s.display(Display::None)) when not visible to ensure no invisible overlay blocks pointer events
-     - Previous issue: inset(0.0) on outer container covered entire terminal area, blocking all pointer events even when overlay hidden
+     - Positioning: Uses absolute() + inset(0.0) + items_center() + justify_center() for full-canvas coverage with centered content
+     - Event handling: Uses .pointer_events_none() on inner container to pass all input through to terminal canvas below
+     - Empty state: Returns empty().style(|s| s.display(Display::None)) when not visible to avoid any layout impact
+     - Outer dyn_container uses z_index(100) to layer overlay above terminal, but pointer_events_none() ensures input passthrough
      - Background thread: std::thread::spawn(move || { sleep(1s); register_ext_trigger(overlay_hide_trigger); }), only hides if 900ms+ elapsed since last show
      - Debugging logs: "Pane {id}: showing overlay '{text}' (was {prev_cols}x{prev_rows})" at INFO level when PTY resize triggers overlay, "Pane {id}: overlay visible with text '{text}'" breadcrumb when overlay renders
 4. focused_pane_id (RwSignal<Option<usize>>) tracks which pane has focus; cursor only shows on focused pane
@@ -356,7 +356,7 @@ src/
 - Background timer thread bypasses event queue delay to ensure timely repaint after animation
 - Canvas paint may not be called during resize animation despite `request_paint()` calls
 - All pane minimums reduced to 100px to prevent layout overflow in windowed mode (fixes splitter hit-testing)
-- Grid overlay event blocking: Fixed by removing inset(0.0) from outer dyn_container and using display:none for empty state - absolute positioning only applied to inner container when visible
+- Grid overlay event blocking: Fixed by using .pointer_events_none() on inner overlay container to pass all input through to terminal canvas - overlay is purely visual and doesn't intercept pointer events
 - File Explorer panel expand/collapse affects terminal height: Minor visual artifact (±2 rows) due to floem's cross-axis recalculation in flex layouts - attempted fixes broke layout, accepted as tradeoff
 
 ## Critical: floem Version Pin (b215faa)

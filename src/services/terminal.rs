@@ -26,14 +26,16 @@ mod platform {
     pub struct TideEventListener {
         pty_writer: Arc<Mutex<Box<dyn Write + Send>>>,
         alive: Arc<AtomicBool>,
+        on_title_change: Arc<dyn Fn(String) + Send + Sync>,
     }
 
     impl TideEventListener {
         pub fn new(
             pty_writer: Arc<Mutex<Box<dyn Write + Send>>>,
             alive: Arc<AtomicBool>,
+            on_title_change: Arc<dyn Fn(String) + Send + Sync>,
         ) -> Self {
-            Self { pty_writer, alive }
+            Self { pty_writer, alive, on_title_change }
         }
 
         fn write_to_pty(&self, text: &str) {
@@ -55,6 +57,10 @@ mod platform {
         fn send_event(&self, event: Event) {
             match event {
                 Event::Wakeup => logging::log_line("DEBUG", "Terminal wakeup event"),
+                Event::Title(title) => {
+                    logging::log_line("DEBUG", &format!("Terminal title changed: {title}"));
+                    (self.on_title_change)(title);
+                }
                 Event::Exit => {
                     logging::log_line("INFO", "Terminal requested exit");
                     self.alive.store(false, Ordering::SeqCst);
@@ -197,10 +203,12 @@ mod platform {
             let bytes_read = Arc::new(AtomicU64::new(0));
 
             // Create terminal state with configured scrollback and event listener.
+            // Title callback is a no-op for now; will be connected to UI later
+            let on_title_change: Arc<dyn Fn(String) + Send + Sync> = Arc::new(|_| {});
             let term = Term::new(
                 term_config,
                 &dims,
-                TideEventListener::new(Arc::clone(&pty_writer), Arc::clone(&alive)),
+                TideEventListener::new(Arc::clone(&pty_writer), Arc::clone(&alive), on_title_change),
             );
             let term = Arc::new(FairMutex::new(term));
 
