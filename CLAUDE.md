@@ -1,3 +1,22 @@
+<!-- OPENSPEC:START -->
+# OpenSpec Instructions
+
+These instructions are for AI assistants working in this project.
+
+Always open `@/openspec/AGENTS.md` when the request:
+- Mentions planning or proposals (words like proposal, spec, change, plan)
+- Introduces new capabilities, breaking changes, architecture shifts, or big performance/security work
+- Sounds ambiguous and you need the authoritative spec before coding
+
+Use `@/openspec/AGENTS.md` to learn:
+- How to create and apply change proposals
+- Spec format and conventions
+- Project structure and guidelines
+
+Keep this managed block so 'openspec update' can refresh the instructions.
+
+<!-- OPENSPEC:END -->
+
 # CLAUDE.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
@@ -41,18 +60,18 @@ src/
 ├── model.rs          # Data models: TerminalPane struct (id, session: RwSignal<Option<Arc<TerminalSession>>>, trigger: ExtSendTrigger, flex_ratio: RwSignal<f64>) represents single terminal pane with flexible width distribution, WorkspaceTab with RwSignal fields (name, root, file_tree, git_status, terminal_panes: Vec<TerminalPane>, next_pane_id) for reactive UI updates and split pane support
 ├── theme.rs          # UiTheme with color definitions
 ├── components/
-│   ├── mod.rs        # Public exports: layout views (app_shell, main_layout, tab_bar, get_last_window_size), terminal functions (terminal_view, force_terminal_repaint on macOS - triggers repaint for all panes), UI atoms (tab_button, tab_button_with_menu, collapsible_panel_header), panel views (collapsible_panel_view, panel_view), icons
+│   ├── mod.rs        # Public exports: layout views (app_shell, main_layout, tab_bar, get_last_window_size), terminal functions (terminal_view on macOS - multi-pane entry point, force_terminal_repaint - triggers repaint for all panes), UI atoms (tab_button, tab_button_with_menu, collapsible_panel_header), panel views (collapsible_panel_view, panel_view), icons
 │   ├── layout.rs     # SplitDragCapture: custom three-pane resizable layout, WindowResized event processing with breadcrumb logging, animation timer (1.2s fixed delay spawned via std::thread), calls force_terminal_repaint when timer expires (each pane's canvas recalculates its own grid size), window size tracking (LAST_WINDOW_WIDTH/HEIGHT atomics exported via get_last_window_size), debounced resize clamping (100ms intervals via last_clamp_at), main_layout columns use height_full() and Overflow::Hidden, h_stack uses items_stretch(), tab_bar uses flex_shrink(0.0) to prevent shrinking from content pressure
 │   ├── terminal/     # Terminal component (modular structure, macOS only)
-│   │   ├── mod.rs    # Module orchestration: terminal_view() entry point with multi-pane support via dyn_stack, FORCE_REPAINT_TRIGGER global, register_force_repaint_trigger/force_terminal_repaint functions
-│   │   ├── constants.rs # Configuration constants: TERMINAL_FONT_SIZE=13.0, CELL_PADDING=8.0, SPLITTER_WIDTH=6.0, PTY_RESIZE_DEBOUNCE_MS=50, overlay timing (OVERLAY_SHOW_DURATION_MS, OVERLAY_MIN_VISIBLE_MS), split pane timing (SPLIT_TRIGGER_DELAY_MS, SPLIT_SECOND_WAVE_MS), terminal_font_families() helper
-│   │   ├── colors.rs # Color palette: TerminalColorList struct with 256-color palette generation (fill_named, fill_cube, fill_gray_ramp), resolve_fg_color/resolve_bg_color functions with ANSI color mapping, background_brush/cursor_brush theme helpers
-│   │   ├── panel.rs  # Panel orchestration: SplitterDragState type (Option<(pane_id, last_x)>), calculate_splitter_drag function with MIN_PANE_RATIO=0.05, splitter styling helpers (splitter_background_color, splitter_hover_color), panel header/container style functions, utility functions (is_last_pane, find_pane_index)
+│   │   ├── mod.rs    # Entry point and global systems: terminal_view() multi-pane entry point via dyn_stack, FORCE_REPAINT_TRIGGER global (OnceLock<Mutex<Option<ExtSendTrigger>>>), register_force_repaint_trigger/force_terminal_repaint functions for animation timer integration, imports from colors/constants/instance/panel submodules
+│   │   ├── constants.rs # Configuration constants: TERMINAL_FONT_SIZE=13.0, CELL_PADDING=8.0, SPLITTER_WIDTH=6.0, PTY_RESIZE_DEBOUNCE_MS=50, overlay timing (OVERLAY_SHOW_DURATION_MS=1000, OVERLAY_MIN_VISIBLE_MS=900), split pane timing (SPLIT_TRIGGER_DELAY_MS=100, SPLIT_SECOND_WAVE_MS=150), terminal_font_families() returns [FamilyOwned::Name("Menlo")]
+│   │   ├── colors.rs # Color palette conversion: TerminalColorList struct with 256-color palette generation (fill_named, fill_cube, fill_gray_ramp), resolve_fg_color/resolve_bg_color functions with ANSI color mapping, background_brush/cursor_brush theme helpers
+│   │   ├── panel.rs  # Multi-pane orchestration and splitter logic: SplitterDragState type (Option<(pane_id_left, last_x)>), DRAG_STATE_SENTINEL=-1.0 (indicates first move after PointerDown), MIN_PANE_RATIO=0.05 (~50px minimum pane), calculate_splitter_drag(delta_x, left_ratio, right_ratio, container_width) computes new flex ratios from pixel deltas, style helpers (splitter_background_color, splitter_hover_color, panel_header_style, panel_container_style), utility functions (is_last_pane, find_pane_index)
 │   │   └── instance/ # Terminal instance implementation (single pane)
-│   │       ├── mod.rs # Instance submodule exports: TerminalInstanceState, renderer, input
-│   │       ├── state.rs # TerminalInstanceState struct: Bundles 14 reactive signals (error_msg, last_size, pending_size, last_resize_request, resize_trigger, cell_size, cell_y_offset, last_pty_resize_at, ime_focused, ime_update_tick, last_ime_cursor_area, last_canvas_size, scroll_accumulator, resize_overlay state), provides new() constructor with default signal values
-│   │       ├── renderer.rs # Canvas rendering helpers: measure_cell_size (font metrics, cell dimensions), calculate_grid_size (canvas to grid conversion), cell_position/is_cell_visible (coordinate helpers), resolve_cell_colors (fg/bg color resolution with selection/inverse support), CellRenderContext struct for render state
-│   │       └── input.rs # Input handling: pointer_to_grid_point (mouse to grid coords), key_to_pty_bytes (keyboard to ANSI sequences), named_key_to_bytes/char_to_pty_bytes (key conversion with modifier support for Ctrl/Alt/Shift), scroll calculation helpers
+│   │       ├── mod.rs # Instance submodule exports: TerminalInstanceState (public), renderer/input modules (macOS only)
+│   │       ├── state.rs # TerminalInstanceState struct: Consolidates 14 reactive signals for one terminal pane (error_msg, last_size, pending_size, last_resize_request, resize_trigger, cell_size, cell_y_offset, last_pty_resize_at, ime_focused, ime_update_tick, last_ime_cursor_area, last_canvas_size, scroll_accumulator, resize_overlay_visible, resize_overlay_text, overlay_show_time, overlay_hide_trigger), provides new() and Default trait with initial signal values
+│   │       ├── renderer.rs # Canvas rendering helpers: measure_cell_size (font metrics with TextLayout, cell dimensions), calculate_grid_size (canvas size to grid conversion with padding), cell_position/is_cell_visible (coordinate helpers), resolve_cell_colors (fg/bg color resolution with selection/inverse support), CellRenderContext struct for render state bundling
+│   │       └── input.rs # Input handling helpers: pointer_to_grid_point (mouse to grid coords), key_to_pty_bytes (keyboard to ANSI sequences), named_key_to_bytes/char_to_pty_bytes (key conversion with modifier support for Ctrl/Alt/Shift), scroll calculation helpers for touchpad accumulation
 │   ├── atoms.rs      # Basic UI components: tab_button, tab_button_with_menu (h_stack with label + chevron dropdown arrow, uses .popout_menu() for Open Folder/Reveal in Finder/Close actions, reactive tab_label via RwSignal<String>), collapsible_panel_header (clickable header with chevron toggle, flex_shrink(0.0) to prevent shrinking), list items, panel headers, splitters, chevron SVG constants (COLLAPSE_CHEVRON, EXPAND_CHEVRON, CHEVRON_DOWN)
 │   ├── panels.rs     # Panel view components: collapsible_panel_view (VSCode-style collapsible panels with internal scrolling, flex_basis(0) pattern for content height isolation - prevents File Explorer content size from affecting sibling panel layouts, flex_grow/shrink with min_height(0.0) for proper flex layout, OverflowX::Hidden to prevent horizontal scrollbar), panel_view (static panels), file_tree_view, git_status_view
 │   ├── icons.rs      # Icon definitions (FILE, FOLDER, GIT)
@@ -60,7 +79,7 @@ src/
 │   └── git_status.rs # Git status display
 └── services/
     ├── mod.rs        # Public exports: clipboard (get/set_clipboard_string), fs (build_tree_entries, list_dir_entries), git (git_status_entries), terminal (TerminalSession)
-    ├── terminal.rs   # TerminalSession: PTY management, IO thread, TideEventListener with on_title_change callback for OSC title events (Event::Title)
+    ├── terminal.rs   # TerminalSession: PTY management with alacritty_terminal and portable-pty, IO thread for reading PTY output, TideEventListener implements EventListener trait with on_title_change callback (Arc<dyn Fn(String) + Send + Sync>) for OSC title change events (Event::Title), clipboard event handlers (ClipboardStore, ClipboardLoad), exit handlers (Event::Exit, Event::ChildExit)
     ├── fs.rs         # Directory traversal functions
     ├── git.rs        # Git status parsing
     └── clipboard.rs  # Clipboard operations (arboard integration)
@@ -94,60 +113,71 @@ src/
 - Animation timer logs "animation timer: 1.2s elapsed, triggering repaint for {w}x{h}" at DEBUG level
 - Uses current_time_ms() helper (SystemTime since UNIX_EPOCH) for millisecond-precision timing
 
-**Terminal Rendering Flow** (terminal/mod.rs, macOS only):
-1. terminal_view() uses dyn_stack to preserve pane views by ID when adding/removing panes
+**Terminal Rendering Flow** (terminal/mod.rs and terminal/instance modules, macOS only):
+1. terminal_view() - Multi-pane orchestration (terminal/mod.rs):
+   - Uses dyn_stack to preserve pane views by ID when adding/removing panes
    - dyn_stack(move || terminal_panes.get(), |pane| pane.id, move |pane| ...) preserves views vs dyn_container rebuilding
    - Each pane's flex_ratio tracked reactively in style closure: .style(move |s| s.flex_basis(0.0).flex_grow(pane_flex_ratio.get()))
    - Layout updates without rebuilding pane views when flex_ratio changes
    - Each pane+splitter wrapped in h_stack, dyn_stack uses flex_row layout for horizontal arrangement
-2. Splitter drag system with dynamic sensitivity (integrated into terminal_view):
-   - Each pane includes splitter on right side (SPLITTER_WIDTH=6.0px), hidden for last pane
+2. Splitter drag system (terminal/mod.rs with panel.rs helpers):
+   - Each pane includes splitter on right side (SPLITTER_WIDTH=6.0px), hidden for last pane via is_last() check
    - panes_stack_id captured via .id() before attaching event handlers to enable container width access during drag
    - drag_state: RwSignal<SplitterDragState> tracks (pane_id_left, last_x) at parent level to avoid view rebuilds during drag
-   - PointerDown: Captures initial state with last_x = -1.0 sentinel (first move will set actual position)
+   - PointerDown: Captures initial state with last_x = DRAG_STATE_SENTINEL (-1.0, indicates first move hasn't happened)
    - PointerMove: Dynamic sensitivity calculation for 1:1 mouse-to-splitter pixel mapping:
      - Gets container_rect via panes_stack_id.layout_rect(), extracts width with .max(100.0) fallback
      - Calculates delta_x = current_x - last_x (incremental pixel delta from last position)
-     - Formula: ratio_delta = delta_x * total_ratio / container_width
-     - Rationale: Makes 1px mouse movement = 1px splitter movement, splitter follows mouse exactly
-     - Previous fixed sensitivity (delta_x / 100.0) caused splitter to move faster than mouse
-     - Applies min_ratio = 0.05 clamp (~50px minimum pane size), updates left/right flex_ratio
+     - Calls calculate_splitter_drag(delta_x, left_ratio, right_ratio, container_width) from panel.rs
+     - Formula: ratio_delta = delta_x * total_ratio / container_width (makes 1px mouse = 1px splitter movement)
+     - Applies MIN_PANE_RATIO=0.05 clamp (~50px minimum pane size), updates left/right flex_ratio
    - PointerUp: Clears drag_state, logs "splitter drag end" breadcrumb
    - Splitter visual feedback: theme.accent on hover/drag, theme.border_subtle otherwise, col-resize cursor
-3. Split pane resize detection and grid overlay:
+3. TerminalInstanceState initialization (terminal/instance/state.rs):
+   - Each pane creates TerminalInstanceState::new() to bundle 14 reactive signals
+   - Signals: error_msg, last_size, pending_size, last_resize_request, resize_trigger, cell_size, cell_y_offset, last_pty_resize_at, ime_focused, ime_update_tick, last_ime_cursor_area, last_canvas_size, scroll_accumulator, resize_overlay_visible, resize_overlay_text, overlay_show_time, overlay_hide_trigger
+   - Default signal values: sizes=(0,0), booleans=false, strings=empty, times=Instant::now(), triggers=ExtSendTrigger::new()
+   - Replaces scattered signal declarations, improves code organization
+4. Split pane resize detection and grid overlay:
    - After splitting, collects existing pane triggers before spawning thread: let triggers: Vec<_> = terminal_panes.get_untracked().iter().map(|p| p.trigger).collect()
    - Thread safety fix: Spawns background thread with cloned triggers instead of accessing signals inside thread
-   - Spawns 50ms delayed trigger to force repaint: register_ext_trigger() for each collected trigger
+   - Spawns SPLIT_TRIGGER_DELAY_MS (100ms) delayed trigger to force repaint: register_ext_trigger() for each collected trigger
    - Also calls view.request_layout() immediately to trigger resize detection
-   - Pattern: let triggers = collect_triggers(); view.request_layout(); std::thread::spawn(move || { sleep(50ms); for t in triggers { register_ext_trigger(t); } })
+   - Pattern: let triggers = collect_triggers(); view.request_layout(); std::thread::spawn(move || { sleep(100ms); for t in triggers { register_ext_trigger(t); } })
    - Grid size overlay (Ghostty-style visual feedback):
      - Displays "cols x rows" centered on terminal canvas during resize
-     - Triggered by canvas size changes detected via prev_canvas_size.get() != current_size
-     - Auto-hides after 1 second via background thread timer
-     - resize_overlay_visible (RwSignal<bool>) controls visibility, resize_overlay_text (RwSignal<String>) stores "80 x 24" format
-     - Overlay rendered via dyn_container checking resize_overlay_visible signal
-     - Visual style: Font size 18.0 (increased from 14.0 for better visibility), theme.text color with theme.accent border (1.0px), semi-transparent background (theme.panel_bg @ 95% opacity), border_radius(8.0)
-     - Positioning: Uses absolute() + inset(0.0) + items_center() + justify_center() for full-canvas coverage with centered content
-     - Event handling: Uses .pointer_events_none() on inner container to pass all input through to terminal canvas below
-     - Empty state: Returns empty().style(|s| s.display(Display::None)) when not visible to avoid any layout impact
-     - Outer dyn_container uses z_index(100) to layer overlay above terminal, but pointer_events_none() ensures input passthrough
-     - Background thread: std::thread::spawn(move || { sleep(1s); register_ext_trigger(overlay_hide_trigger); }), only hides if 900ms+ elapsed since last show
-     - Debugging logs: "Pane {id}: showing overlay '{text}' (was {prev_cols}x{prev_rows})" at INFO level when PTY resize triggers overlay, "Pane {id}: overlay visible with text '{text}'" breadcrumb when overlay renders
-4. focused_pane_id (RwSignal<Option<usize>>) tracks which pane has focus; cursor only shows on focused pane
-5. terminal_pane_view() renders individual pane:
+     - Triggered by canvas size changes detected via state.last_canvas_size.get() != current_size
+     - Auto-hides after OVERLAY_SHOW_DURATION_MS (1000ms) via background thread timer
+     - state.resize_overlay_visible (RwSignal<bool>) controls visibility, state.resize_overlay_text (RwSignal<String>) stores "80 x 24" format
+     - **Rendered directly in canvas paint** (not via dyn_container) to avoid event blocking issues
+     - Visual style: Font size 18.0, Weight::BOLD, theme.text color, theme.accent border, semi-transparent background (theme.panel_bg @ 95% opacity), border_radius(8.0)
+     - Border implementation: Two-layer fill (larger border_rect with theme.accent, smaller box_rect with bg_color)
+     - Positioning: Centered via (size.width - box_width) / 2.0 calculation in canvas coordinates
+     - Background thread: std::thread::spawn(move || { sleep(1s); register_ext_trigger(state.overlay_hide_trigger); }), only hides if OVERLAY_MIN_VISIBLE_MS (900ms) elapsed since last show
+     - Debugging logs: "Pane {id}: showing overlay '{text}' (was {prev_cols}x{prev_rows})" at INFO level when PTY resize triggers overlay
+     - **Acceptance Criteria**:
+       1. Split pane operation shows overlay with correct centered position
+       2. Fullscreen/window resize shows overlay with correct centered position
+       3. Initial terminal startup does NOT show overlay (expected behavior - no resize event)
+5. focused_pane_id (RwSignal<Option<usize>>) tracks which pane has focus; cursor only shows on focused pane
+6. terminal_pane_view() renders individual pane (terminal/mod.rs):
+   - Creates TerminalInstanceState::new() to bundle reactive signals
    - `canvas()` closure receives paint context and size
-   - Calculate grid dimensions from canvas size and cell metrics
-   - Build color palette from theme using `TerminalColorList::from_palette()`
-   - Debounce PTY resize (50ms threshold) via `ExtSendTrigger` + background thread:
-     - Only updates pending_size when grid dimensions actually change (prevents debounce race condition)
+   - Rendering logic delegates to terminal/instance/renderer.rs helpers:
+     - measure_cell_size() calculates cell dimensions from TextLayout font metrics
+     - calculate_grid_size() converts canvas size to grid (cols, rows) with CELL_PADDING
+     - resolve_cell_colors() handles fg/bg color with selection/inverse flag support
+   - Build color palette from theme using `TerminalColorList::from_palette()` (terminal/colors.rs)
+   - Debounce PTY resize (PTY_RESIZE_DEBOUNCE_MS=50ms threshold) via `ExtSendTrigger` + background thread:
+     - Only updates state.pending_size when grid dimensions actually change (prevents debounce race condition)
      - Spawns 60ms timer (must exceed 50ms threshold) to trigger resize effect
      - Fixed race condition: Previously updated pending_size on every canvas paint even when unchanged, causing debounce check to always fail
      - Debug output via eprintln!: tracks pending vs last sizes, skip reasons (zero size, no change, debounce), execution timing
-   - Render using `last_size` (not `pending_size`) to avoid flicker during resize
-5. Track render performance via `logging::record_terminal_render()` (per pane)
-6. IME cursor positioning: Effect tracks cell_size/cursor changes, anchors IME candidate window at terminal caret using canvas-relative coordinates
-7. Force repaint trigger (FORCE_REPAINT_TRIGGER) registered during initialization for external repaint requests
-8. Cell rendering loop (per pane):
+   - Render using `state.last_size` (not `pending_size`) to avoid flicker during resize
+7. Track render performance via `logging::record_terminal_render()` (per pane)
+8. IME cursor positioning: Effect tracks state.cell_size/cursor changes, anchors IME candidate window at terminal caret using canvas-relative coordinates
+9. Force repaint trigger (FORCE_REPAINT_TRIGGER) registered during initialization for external repaint requests
+10. Cell rendering loop (per pane in terminal_pane_view):
    - **Padding offset**: All terminal content rendered with 8px padding on each side
      - Cell position: x = 8.0 + col * cell_width, y = 8.0 + row * cell_height
      - Bounds check: x + cell_width > size.width - 7.0 || y + cell_height > size.height - 7.0 (skip cells outside padded area)
@@ -171,14 +201,14 @@ src/
    - Wide character support: CJK/emoji use cell_width * 2.0 for proper display
    - Text layout: Uses floem TextLayout with Menlo font, 13px size
 9. Scroll handling (PointerWheel events, per pane):
-   - scroll_accumulator RwSignal<f64> accumulates sub-line scroll deltas for smooth touchpad scrolling
-   - Accumulation: accumulated = scroll_accumulator.get_untracked() + dy
+   - state.scroll_accumulator RwSignal<f64> accumulates sub-line scroll deltas for smooth touchpad scrolling
+   - Accumulation: accumulated = state.scroll_accumulator.get_untracked() + dy
    - Lines calculation: lines = (accumulated / cell_height).trunc() as i32
    - Remainder tracking: accumulated -= (lines as f64) * cell_height after scrolling
    - Scroll direction: Negative dy (scroll up gesture) maps to positive delta (show earlier content) via -lines
    - Logs: "terminal scroll: dy={dy:.1} acc={accumulated:.1} lines={scroll_delta}" when scrolling occurs
    - Requests canvas repaint after scroll via canvas_id.request_paint()
-10. Keyboard input with control character support:
+10. Keyboard input with control character support (input handling in terminal/instance/input.rs):
    - Regular keys: Matches Key::Character(ch) and writes string directly to PTY via session.write()
    - Control character mapping: Ctrl+key combinations generate ASCII control codes (0x01-0x1A)
      - Ctrl+A = 0x01, Ctrl+B = 0x02, ..., Ctrl+Z = 0x1A

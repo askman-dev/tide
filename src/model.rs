@@ -2,7 +2,7 @@ use crate::services::TerminalSession;
 use floem::ext_event::ExtSendTrigger;
 use floem::reactive::RwSignal;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// A single terminal pane with its own session
 #[derive(Clone)]
@@ -12,6 +12,12 @@ pub struct TerminalPane {
     pub trigger: ExtSendTrigger,
     /// Flex ratio for width (1.0 = equal share with other panes)
     pub flex_ratio: RwSignal<f64>,
+    /// Pane title (dynamically updated from command)
+    pub title: RwSignal<String>,
+    /// Signal to programmatically request focus
+    pub should_focus: RwSignal<bool>,
+    /// Buffer for cross-thread title updates
+    pub title_buffer: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Clone)]

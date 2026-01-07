@@ -144,6 +144,7 @@ mod platform {
         pub fn new(
             workspace_root: &Path,
             notify: Arc<dyn Fn() + Send + Sync>,
+            on_title_change: Arc<dyn Fn(String) + Send + Sync>,
         ) -> io::Result<Arc<Self>> {
             const DEFAULT_COLS: u16 = 80;
             const DEFAULT_ROWS: u16 = 24;
@@ -203,8 +204,6 @@ mod platform {
             let bytes_read = Arc::new(AtomicU64::new(0));
 
             // Create terminal state with configured scrollback and event listener.
-            // Title callback is a no-op for now; will be connected to UI later
-            let on_title_change: Arc<dyn Fn(String) + Send + Sync> = Arc::new(|_| {});
             let term = Term::new(
                 term_config,
                 &dims,
@@ -451,6 +450,7 @@ mod platform {
         pub fn new(
             workspace_root: &Path,
             _notify: Arc<dyn Fn() + Send + Sync>,
+            _on_title_change: Arc<dyn Fn(String) + Send + Sync>,
         ) -> io::Result<Arc<Self>> {
             logging::log_line(
                 "WARN",
@@ -493,7 +493,7 @@ mod tests {
     #[test]
     fn terminal_session_new_succeeds() {
         let root = env::current_dir().unwrap();
-        let session = TerminalSession::new(&root, Arc::new(|| {}))
+        let session = TerminalSession::new(&root, Arc::new(|| {}), Arc::new(|_| {}))
             .expect("terminal session should construct");
         let _ = session;
     }
@@ -502,7 +502,7 @@ mod tests {
     #[test]
     fn terminal_session_scrollback_at_least_500() {
         let root = env::current_dir().unwrap();
-        let session = TerminalSession::new(&root, Arc::new(|| {}))
+        let session = TerminalSession::new(&root, Arc::new(|| {}), Arc::new(|_| {}))
             .expect("terminal session should construct");
         assert!(session.scrollback() >= 500);
     }

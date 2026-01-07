@@ -4,9 +4,8 @@ mod instance;
 #[cfg(target_os = "macos")]
 mod panel;
 
-use crate::components::atoms::meta_text;
 use crate::model::{TerminalPane, WorkspaceTab};
-use crate::services::TerminalSession;
+use crate::services::{Launcher, LauncherRunIn, TerminalSession};
 use crate::theme::UiTheme;
 
 #[cfg(target_os = "macos")]
@@ -60,7 +59,7 @@ use floem::{
         Brush, Color,
     },
     reactive::{create_effect, RwSignal},
-    text::{Attrs, AttrsList, TextLayout},
+    text::{Attrs, AttrsList, TextLayout, Weight},
 };
 
 #[cfg(target_os = "macos")]
@@ -108,7 +107,7 @@ pub fn force_terminal_repaint() {
 /// `alacritty_terminal` and `portable-pty`.
 /// On non-macOS platforms it shows a simple placeholder message.
 #[cfg(target_os = "macos")]
-pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
+pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab, launchers: RwSignal<Vec<Launcher>>) -> impl IntoView {
     use floem::style::CursorStyle;
 
     let workspace_name = workspace.name;
@@ -183,11 +182,11 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
             h_stack((pane_view, splitter))
                 .style(move |s| {
                     let flex = pane_flex_ratio.get();
-                    s.flex_basis(0.0).flex_grow(flex as f32).height_full()
+                    s.flex_basis(0.0).flex_grow(flex as f32).height_full().min_width(0.0)
                 })
         },
     )
-    .style(|s| s.flex_row().width_full().height_full());
+    .style(|s| s.flex_row().width_full().height_full().min_width(0.0));
 
     // Capture the panes_stack ViewId so we can get its width during drag
     let panes_stack_id = panes_stack.id();
@@ -261,12 +260,7 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
         });
 
     v_stack((
-        label(|| "Terminal").style(move |s| {
-            s.font_size(12.0)
-                .font_bold()
-                .color(theme.text_muted)
-        }),
-        meta_text(format!("Workspace: {}", workspace_name.get()), theme),
+        control_center_header(launchers, terminal_panes, next_pane_id, focused_pane_id, workspace_root, theme),
         container(panes_stack).style(move |s| {
             s.width_full()
                 .flex_grow(1.0)  // Fill remaining height
@@ -274,9 +268,10 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
                 .background(theme.panel_bg)
                 .border(1.0)
                 .border_color(theme.border_subtle)
+                .min_width(0.0)
         }),
     ))
-    .style(|s| s.width_full().height_full().row_gap(8.0))
+    .style(|s| s.width_full().height_full().row_gap(8.0).min_width(0.0))
 }
 
 
@@ -293,6 +288,9 @@ fn terminal_pane_view(
     let session = pane.session;
     let term_update_trigger = pane.trigger;
     let pane_id = pane.id;
+    let pane_title = pane.title;
+    let pane_should_focus = pane.should_focus;
+    let pane_title_buffer = pane.title_buffer.clone();
 
     // Bundle all instance state signals
     let state = TerminalInstanceState::new();
@@ -321,6 +319,13 @@ fn terminal_pane_view(
 
     let terminal_canvas = canvas({
         move |cx, size| {
+            // Check for title updates
+            if let Ok(mut guard) = pane_title_buffer.try_lock() {
+                if let Some(new_title) = guard.take() {
+                    pane_title.set(new_title);
+                }
+            }
+
             let workspace_root = workspace_root.get_untracked();
             let font_families = terminal_font_families();
             let render_start = Instant::now();
@@ -357,7 +362,18 @@ fn terminal_pane_view(
                     })
                 };
 
-                match TerminalSession::new(&workspace_root, notify) {
+                let title_cb = {
+                    let buf = pane_title_buffer.clone();
+                    let trig = term_update_trigger.clone();
+                    Arc::new(move |title: String| {
+                        if let Ok(mut guard) = buf.lock() {
+                            *guard = Some(title);
+                        }
+                        register_ext_trigger(trig);
+                    })
+                };
+
+                match TerminalSession::new(&workspace_root, notify, title_cb) {
                     Ok(new_session) => {
                         current_session = Some(new_session.clone());
                         session.set(Some(new_session));
@@ -372,9 +388,7 @@ fn terminal_pane_view(
                 }
             }
 
-            let Some(session) = current_session else {
-                return;
-            };
+            let Some(session) = current_session else { return; };
 
             // 4. Measure (and cache) cell size.
             // Recalculate on every canvas size change to ensure accurate layout.
@@ -636,6 +650,49 @@ fn terminal_pane_view(
                 cx.draw_text(&layout_sub, floem::kurbo::Point::new(sx, sy));
             }
 
+            // Draw resize overlay if visible (directly in canvas, no event blocking)
+            if resize_overlay_visible.get_untracked() {
+                let overlay_text = resize_overlay_text.get_untracked();
+                if !overlay_text.is_empty() {
+                    // Measure text
+                    let attrs = Attrs::new()
+                        .color(theme.text)
+                        .font_size(18.0)
+                        .weight(Weight::BOLD)
+                        .family(&font_families);
+                    let mut layout = TextLayout::new();
+                    layout.set_text(&overlay_text, AttrsList::new(attrs), None);
+                    let text_size = layout.size();
+                    
+                    // Calculate centered position
+                    let padding_h = 20.0;
+                    let padding_v = 12.0;
+                    let box_width = text_size.width + padding_h * 2.0;
+                    let box_height = text_size.height + padding_v * 2.0;
+                    let box_x = (size.width - box_width) / 2.0;
+                    let box_y = (size.height - box_height) / 2.0;
+                    
+                    // Draw background box with rounded corners
+                    let box_rect = floem::kurbo::RoundedRect::new(
+                        box_x, box_y, box_x + box_width, box_y + box_height, 8.0
+                    );
+                    let bg_color = theme.panel_bg.with_alpha(0.95);
+                    cx.fill(&box_rect, &bg_color, 0.0);
+                    
+                    // Draw border using fill with a slightly larger rect
+                    let border_rect = floem::kurbo::RoundedRect::new(
+                        box_x - 1.0, box_y - 1.0, box_x + box_width + 1.0, box_y + box_height + 1.0, 9.0
+                    );
+                    cx.fill(&border_rect, &theme.accent, 0.0);
+                    cx.fill(&box_rect, &bg_color, 0.0);
+                    
+                    // Draw text
+                    let text_x = box_x + padding_h;
+                    let text_y = box_y + padding_v;
+                    cx.draw_text(&layout, floem::kurbo::Point::new(text_x, text_y));
+                }
+            }
+
             logging::record_terminal_render(
                 render_start.elapsed(),
                 rendered_cells,
@@ -646,6 +703,14 @@ fn terminal_pane_view(
     });
 
     let canvas_id = terminal_canvas.id();
+
+    // Effect to handle programmatic focus request
+    create_effect(move |_| {
+        if pane_should_focus.get() {
+            canvas_id.request_focus();
+            pane_should_focus.set(false);
+        }
+    });
 
     // Track if we're in selection mode (primary button held)
     let is_selecting = RwSignal::new(false);
@@ -691,9 +756,7 @@ fn terminal_pane_view(
             return;
         }
 
-        let Some(sess) = session.get_untracked() else {
-            return;
-        };
+        let Some(sess) = session.get_untracked() else { return; };
         if !sess.is_active() {
             return;
         }
@@ -716,9 +779,7 @@ fn terminal_pane_view(
             ))
         });
 
-        let Some((pos, size)) = next else {
-            return;
-        };
+        let Some((pos, size)) = next else { return; };
 
         let should_send = match last_ime_cursor_area.get_untracked() {
             None => true,
@@ -914,11 +975,19 @@ fn terminal_pane_view(
                         }
                     }
 
-                    let Some(session) = session.get_untracked() else {
-                        return EventPropagation::Continue;
-                    };
+                                        let Some(session) = session.get_untracked() else {
 
-                    let modifiers = key_event.modifiers;
+                                            return EventPropagation::Continue;
+
+                                        };
+
+                    
+
+
+
+                    
+
+                                        let modifiers = key_event.modifiers;
 
                     // Handle Cmd+C / Cmd+V for clipboard integration.
                     if modifiers.meta() {
@@ -1057,9 +1126,7 @@ fn terminal_pane_view(
                     logging::breadcrumb(format!("terminal ime commit: len={}", text.len()));
                     ime_update_tick.update(|tick| *tick = tick.wrapping_add(1));
                     
-                    let Some(session) = session.get_untracked() else {
-                        return EventPropagation::Continue;
-                    };
+                    let Some(session) = session.get_untracked() else { return EventPropagation::Continue; };
                     
                     if !session.is_active() {
                         return EventPropagation::Stop;
@@ -1081,9 +1148,7 @@ fn terminal_pane_view(
         })
         .on_event(EventListener::PointerWheel, move |event| {
             logging::measure_ui_event("terminal scroll", || {
-                let Some(session) = session.get_untracked() else {
-                    return EventPropagation::Continue;
-                };
+                let Some(session) = session.get_untracked() else { return EventPropagation::Continue; };
                 if !session.is_active() { return EventPropagation::Continue; }
 
                 let (_, cell_height) = cell_size.get_untracked();
@@ -1125,9 +1190,7 @@ fn terminal_pane_view(
         })
         .on_event(EventListener::PointerDown, move |event| {
             logging::measure_ui_event("terminal pointer down", || {
-                let Some(session) = session.get_untracked() else {
-                    return EventPropagation::Continue;
-                };
+                let Some(session) = session.get_untracked() else { return EventPropagation::Continue; };
 
                 let (cell_width, cell_height) = cell_size.get_untracked();
                 if cell_width <= 0.0 || cell_height <= 0.0 {
@@ -1200,9 +1263,7 @@ fn terminal_pane_view(
         })
         .on_event(EventListener::PointerMove, move |event| {
             logging::measure_ui_event("terminal pointer move", || {
-                let Some(session) = session.get_untracked() else {
-                    return EventPropagation::Continue;
-                };
+                let Some(session) = session.get_untracked() else { return EventPropagation::Continue; };
                 // Allow selection even if inactive? Yes, why not.
 
                 let (cell_width, cell_height) = cell_size.get_untracked();
@@ -1326,14 +1387,15 @@ fn terminal_pane_view(
                     let new_id = next_pane_id.get();
                     next_pane_id.set(new_id + 1);
 
-                    let new_pane = TerminalPane {
-                        id: new_id,
-                        session: RwSignal::new(None),
-                        trigger: floem::ext_event::ExtSendTrigger::new(),
-                        flex_ratio: RwSignal::new(1.0),
-                    };
-
-                    terminal_panes.update(|panes| {
+                                                                let new_pane = TerminalPane {
+                                                                    id: new_id,
+                                                                    session: RwSignal::new(None),
+                                                                    trigger: floem::ext_event::ExtSendTrigger::new(),
+                                                                    flex_ratio: RwSignal::new(1.0),
+                                                                    title: RwSignal::new("Terminal".to_string()),
+                                                                    should_focus: RwSignal::new(true),
+                                                                    title_buffer: Arc::new(Mutex::new(None)),
+                                                                };                    terminal_panes.update(|panes| {
                         // Find current pane index and insert after it
                         if let Some(idx) = panes.iter().position(|p| p.id == pane_id) {
                             panes.insert(idx + 1, new_pane);
@@ -1372,14 +1434,15 @@ fn terminal_pane_view(
                     let new_id = next_pane_id.get();
                     next_pane_id.set(new_id + 1);
 
-                    let new_pane = TerminalPane {
-                        id: new_id,
-                        session: RwSignal::new(None),
-                        trigger: floem::ext_event::ExtSendTrigger::new(),
-                        flex_ratio: RwSignal::new(1.0),
-                    };
-
-                    terminal_panes.update(|panes| {
+                                                                let new_pane = TerminalPane {
+                                                                    id: new_id,
+                                                                    session: RwSignal::new(None),
+                                                                    trigger: floem::ext_event::ExtSendTrigger::new(),
+                                                                    flex_ratio: RwSignal::new(1.0),
+                                                                    title: RwSignal::new("Terminal".to_string()),
+                                                                    should_focus: RwSignal::new(true),
+                                                                    title_buffer: Arc::new(Mutex::new(None)),
+                                                                };                    terminal_panes.update(|panes| {
                         // Find current pane index and insert before it
                         if let Some(idx) = panes.iter().position(|p| p.id == pane_id) {
                             panes.insert(idx, new_pane);
@@ -1425,56 +1488,16 @@ fn terminal_pane_view(
             menu
         });
 
-    // Grid size overlay (centered, shows during resize)
-    // Use dyn_container to conditionally show/hide overlay with proper event handling
-    let grid_overlay = dyn_container(
-        move || resize_overlay_visible.get(),
-        move |visible| {
-            if visible {
-                let text = resize_overlay_text.get();
-                logging::breadcrumb(format!("Pane {}: overlay visible with text '{}'", pane_id, text));
-                // Overlay container: absolute + full size + centered content
-                container(
-                    container(label(move || text.clone()).style(move |s| {
-                        s.font_size(18.0)
-                            .font_bold()
-                            .color(theme.text)
-                            .padding(12.0)
-                            .padding_horiz(20.0)
-                    }))
-                    .style(move |s| {
-                        s.background(theme.panel_bg.with_alpha(0.95))
-                            .border_radius(8.0)
-                            .border(1.0)
-                            .border_color(theme.accent)
-                    })
-                )
-                .style(|s| {
-                    s.absolute()
-                        .inset(0.0)
-                        .items_center()
-                        .justify_center()
-                        .pointer_events_none()  // Don't block input to terminal
-                })
-                .into_any()
-            } else {
-                // When not visible, return empty with no size to avoid blocking input
-                empty().style(|s| s.display(floem::style::Display::None)).into_any()
-            }
-        },
-    )
-    .style(|s| s.z_index(100));
-
-    // Return terminal wrapper with overlay on top
-    stack((
-        terminal_wrapper.style(|s| s.flex_grow(1.0).height_full()),
-        grid_overlay,
-    ))
-    .style(|s| s.flex_grow(1.0).height_full())
+    // Overlay is now drawn directly in canvas (no event blocking)
+    // Wrap with pane header
+    v_stack((
+        pane_header(pane_title, theme),
+        terminal_wrapper.style(|s| s.flex_grow(1.0).width_full().height_full())
+    )).style(|s| s.width_full().height_full().min_width(0.0))
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
+pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab, _launchers: RwSignal<Vec<Launcher>>) -> impl IntoView {
     let workspace_name = workspace.name;
     v_stack((
         label(|| "Terminal").style(move |s| {
@@ -1496,5 +1519,210 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab) -> impl IntoView {
                 .color(theme.text_soft)
         }),
     ))
-    .style(|s| s.width_full().height_full().row_gap(8.0))
+    .style(|s| s.width_full().height_full().row_gap(8.0).min_width(0.0))
+}
+
+#[cfg(target_os = "macos")]
+fn control_center_header(
+    launchers: RwSignal<Vec<Launcher>>,
+    terminal_panes: RwSignal<Vec<TerminalPane>>,
+    next_pane_id: RwSignal<usize>,
+    focused_pane_id: RwSignal<Option<usize>>,
+    workspace_root: RwSignal<PathBuf>,
+    theme: UiTheme,
+) -> impl IntoView {
+    // Label
+    let label_view = label(|| "Control Center").style(move |s| {
+        s.font_size(12.0)
+            .font_bold()
+            .color(theme.text_muted)
+            .margin_right(12.0)
+    });
+
+    // Launcher buttons
+    let launchers_list = dyn_stack(
+        move || launchers.get(),
+        |launcher| launcher.name.clone(),
+        move |launcher| {
+            let cmd = launcher.command.clone();
+            let run_in = launcher.run_in.clone();
+            let name = launcher.name.clone();
+            let name_label = name.clone();
+            let terminal_panes = terminal_panes;
+            let next_pane_id = next_pane_id;
+            let focused_pane_id = focused_pane_id;
+            let workspace_root = workspace_root;
+            
+            container(label(move || name_label.clone()).style(move |s| {
+                s.font_size(11.0).color(theme.text)
+            }))
+            .style(move |s| {
+                s.padding_horiz(8.0)
+                    .padding_vert(4.0)
+                    .border(1.0)
+                    .border_color(theme.border_subtle)
+                    .border_radius(4.0)
+                    .background(theme.element_bg)
+                    .hover(|s| s.background(theme.accent.with_alpha(0.2)))
+                    .cursor(floem::style::CursorStyle::Pointer)
+            })
+            .on_click_stop(move |_| {
+                logging::log_line("INFO", &format!("Executing launcher: {}", name));
+                
+                match run_in {
+                    LauncherRunIn::Current => {
+                        // Find focused pane or fallback to first pane
+                        let pane_id_opt = focused_pane_id.get_untracked();
+                        let panes = terminal_panes.get_untracked();
+                        
+                        let target_pane = if let Some(id) = pane_id_opt {
+                            panes.iter().find(|p| p.id == id).cloned()
+                        } else {
+                            panes.first().cloned()
+                        };
+                        
+                        if let Some(pane) = target_pane {
+                            pane.should_focus.set(true);
+                            if let Some(session) = pane.session.get_untracked() {
+                                let cmd_str = cmd.clone();
+                                if let Err(err) = session.write(cmd_str.as_bytes()) {
+                                    logging::log_line("ERROR", &format!("Launcher write failed: {}", err));
+                                }
+                            }
+                        }
+                    },
+                    LauncherRunIn::NewSplit => {
+                        // Split right from currently focused pane (or last pane)
+                        let pane_id_opt = focused_pane_id.get_untracked();
+                        let panes = terminal_panes.get_untracked();
+                        
+                        let target_idx = if let Some(id) = pane_id_opt {
+                            panes.iter().position(|p| p.id == id).unwrap_or(panes.len().saturating_sub(1))
+                        } else {
+                            panes.len().saturating_sub(1)
+                        };
+
+                        let new_id = next_pane_id.get();
+                        next_pane_id.set(new_id + 1);
+
+                        let new_pane = TerminalPane {
+                            id: new_id,
+                            session: RwSignal::new(None),
+                            trigger: ExtSendTrigger::new(),
+                            flex_ratio: RwSignal::new(1.0),
+                            title: RwSignal::new("Terminal".to_string()),
+                            should_focus: RwSignal::new(true),
+                            title_buffer: Arc::new(Mutex::new(None)),
+                        };
+                        
+                        // Initialize session immediately so we can write to it
+                        let notify = {
+                            let trigger = new_pane.trigger.clone();
+                            Arc::new(move || {
+                                register_ext_trigger(trigger);
+                            })
+                        };
+                        
+                        let title_cb = {
+                            let buf = new_pane.title_buffer.clone();
+                            let trig = new_pane.trigger.clone();
+                            Arc::new(move |title: String| {
+                                if let Ok(mut guard) = buf.lock() {
+                                    *guard = Some(title);
+                                }
+                                register_ext_trigger(trig);
+                            })
+                        };
+                        
+                        match TerminalSession::new(&workspace_root.get_untracked(), notify, title_cb) {
+                            Ok(session) => {
+                                // Write command
+                                let cmd_str = cmd.clone();
+                                let _ = session.write(cmd_str.as_bytes());
+                                
+                                new_pane.session.set(Some(session));
+                            }
+                            Err(e) => logging::log_line("ERROR", &format!("Failed to init session for launcher: {}", e)),
+                        }
+
+                        // Insert after target
+                        terminal_panes.update(|panes| {
+                             if target_idx < panes.len() {
+                                panes.insert(target_idx + 1, new_pane.clone());
+                             } else {
+                                panes.push(new_pane.clone());
+                             }
+                        });
+                        
+                        // Trigger layout update
+                         let triggers: Vec<_> = terminal_panes.get_untracked()
+                            .iter()
+                            .map(|p| p.trigger.clone())
+                            .collect();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                            for trigger in triggers {
+                                register_ext_trigger(trigger);
+                            }
+                        });
+                    }
+                }
+            })
+        }
+    ).style(|s| s.flex_row().col_gap(8.0).items_center().min_width(0.0));
+
+    h_stack((label_view, launchers_list))
+        .style(|s| s.width_full().items_center().height(28.0).padding_horiz(8.0).min_width(0.0))
+}
+
+
+
+#[cfg(target_os = "macos")]
+fn pane_header(title: RwSignal<String>, theme: UiTheme) -> impl IntoView {
+    let title_label = label(move || title.get()).style(move |s| {
+        s.font_size(11.0)
+            .color(theme.text)
+            .font_bold()
+            .text_ellipsis()
+            .width(0.0)
+            .min_width(0.0)
+            .flex_grow(1.0)
+    });
+    
+    // Placeholder buttons style
+    let btn_style = move |s: floem::style::Style| {
+        s.padding_horiz(6.0)
+            .padding_vert(2.0)
+            .border_radius(4.0)
+            .hover(move |s| s.background(theme.element_bg))
+            .color(theme.text_muted)
+            .font_size(10.0)
+            .cursor(floem::style::CursorStyle::Pointer)
+    };
+    
+    let copy_path = label(|| "📋 Path").style(move |s| btn_style(s))
+        .on_click_stop(|_| { logging::log_line("INFO", "Copy Path clicked (placeholder)"); });
+        
+    let copy_output = label(|| "📋 Output").style(move |s| btn_style(s))
+        .on_click_stop(|_| { logging::log_line("INFO", "Copy Output clicked (placeholder)"); });
+        
+    let close = label(|| "×").style(move |s| btn_style(s).color(theme.text))
+        .on_click_stop(|_| { logging::log_line("INFO", "Close Pane clicked (placeholder)"); });
+
+    h_stack((
+        title_label,
+        copy_path,
+        copy_output,
+        close
+    )).style(move |s| {
+        s.width_full()
+            .height(24.0)
+            .items_center()
+            .padding_horiz(8.0)
+            .background(theme.panel_bg)
+            .border_bottom(1.0)
+            .border_color(theme.border_subtle)
+            .min_width(0.0)
+            .set(floem::style::OverflowX, floem::taffy::Overflow::Hidden)
+    })
 }

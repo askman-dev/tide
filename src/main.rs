@@ -50,7 +50,9 @@ fn main() {
         floem::window::WindowConfig::default()
     };
 
+    let initial_state = services::load_state();
+
     floem::Application::new_with_config(floem::AppConfig::default().exit_on_close(true))
-        .window(|_| app::app_view(), Some(window_config))
+        .window(move |_| app::app_view(initial_state.clone()), Some(window_config))
         .run();
 }

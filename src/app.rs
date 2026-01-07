@@ -3,14 +3,14 @@ use crate::components::{
     tab_button, tab_button_with_menu, terminal_view, FILE, FOLDER, GIT,
 };
 use crate::model::{TerminalPane, WorkspaceTab};
-use crate::services::{build_tree_entries, git_status_entries};
+use crate::services::{build_tree_entries, git_status_entries, load_launchers, Launcher, AppState, save_state};
 use crate::theme::UiTheme;
 use floem::ext_event::{register_ext_trigger, ExtSendTrigger};
 use floem::prelude::*;
 use floem::reactive::create_effect;
 use crate::logging;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 #[cfg(target_os = "macos")]
@@ -18,15 +18,48 @@ use std::process::Command;
 
 static UI_WATCHDOG: OnceLock<()> = OnceLock::new();
 
-pub fn app_view() -> impl IntoView {
+pub fn app_view(initial_state: AppState) -> impl IntoView {
     let theme = UiTheme::new();
     install_ui_watchdog();
-    let initial_root = std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    let tabs = RwSignal::new(vec![build_tab(0, initial_root)]);
-    let active_tab = RwSignal::new(0usize);
-    let next_tab_id = RwSignal::new(1usize);
+    
+    // Load tabs from state
+    let mut initial_tabs = Vec::new();
+    for (i, path) in initial_state.workspaces.iter().enumerate() {
+        initial_tabs.push(build_tab(i, path.clone()));
+    }
+    
+    // Fallback if empty
+    if initial_tabs.is_empty() {
+        let root = std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        initial_tabs.push(build_tab(0, root));
+    }
+    
+    let next_id_val = initial_tabs.last().map(|t| t.id + 1).unwrap_or(1);
+    
+    let active_id = if initial_state.active_workspace_index < initial_tabs.len() {
+        initial_tabs[initial_state.active_workspace_index].id
+    } else {
+        initial_tabs.first().map(|t| t.id).unwrap_or(0)
+    };
+
+    let launchers = RwSignal::new(load_launchers());
+    let tabs = RwSignal::new(initial_tabs);
+    let active_tab = RwSignal::new(active_id);
+    let next_tab_id = RwSignal::new(next_id_val);
+
+    // Effect to auto-save state
+    create_effect(move |_| {
+        let current_tabs = tabs.get();
+        let active_id = active_tab.get();
+        
+        let paths: Vec<PathBuf> = current_tabs.iter().map(|t| t.root.get()).collect();
+        let active_idx = current_tabs.iter().position(|t| t.id == active_id).unwrap_or(0);
+        
+        // logging::log_line("DEBUG", &format!("Auto-saving state: {} tabs", paths.len()));
+        save_state(&paths, active_idx);
+    });
 
     let tab_list = dyn_stack(
         move || tabs.get(),
@@ -138,7 +171,7 @@ pub fn app_view() -> impl IntoView {
         let tabs_vec = tabs.get();
         let tab = tabs_vec.into_iter().find(|tab| tab.id == tab_id);
         match tab {
-            Some(tab) => workspace_view(tab, theme).into_any(),
+            Some(tab) => workspace_view(tab, launchers, theme).into_any(),
             None => label(|| "No workspace").into_any(),
         }
     })
@@ -174,7 +207,11 @@ fn install_ui_watchdog() {
     });
 }
 
-fn workspace_view(tab: WorkspaceTab, theme: UiTheme) -> impl IntoView {
+fn workspace_view(
+    tab: WorkspaceTab,
+    launchers: RwSignal<Vec<Launcher>>,
+    theme: UiTheme,
+) -> impl IntoView {
     let workspace_name = tab.name;
     let workspace_root = tab.root;
     let file_tree_entries = tab.file_tree;
@@ -232,7 +269,7 @@ fn workspace_view(tab: WorkspaceTab, theme: UiTheme) -> impl IntoView {
             .set(OverflowY, floem::taffy::Overflow::Hidden)
     });
 
-    let center_column = terminal_view(theme, tab);
+    let center_column = terminal_view(theme, tab, launchers);
     let right_column = editor_workspace_view(theme);
 
     main_layout(left_column, center_column, right_column, theme)
@@ -484,6 +521,9 @@ fn build_tab(id: usize, root: PathBuf) -> WorkspaceTab {
         session: RwSignal::new(None),
         trigger: ExtSendTrigger::new(),
         flex_ratio: RwSignal::new(1.0),
+        title: RwSignal::new("Terminal".to_string()),
+        should_focus: RwSignal::new(false),
+        title_buffer: Arc::new(Mutex::new(None)),
     };
 
     WorkspaceTab {
