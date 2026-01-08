@@ -16,6 +16,7 @@ use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
 use floem::reactive::create_effect;
 use floem::style::CursorStyle;
+use floem::views::editor::text::WrapMethod;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -723,6 +724,7 @@ fn editor_workspace_view(
                     let content = tab.content.clone();
                     // Use text_editor for code viewing
                     return text_editor(content)
+                        .editor_style(move |s| s.wrap_method(WrapMethod::None))
                         .style(move |s| {
                             s.flex_grow(1.0)
                                 .size_full()
