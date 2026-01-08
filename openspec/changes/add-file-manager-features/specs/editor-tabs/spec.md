@@ -88,6 +88,6 @@
 ### Known Limitations
 以下功能延迟到后续版本：
 
-1. **拖拉性能**: 打开多个标签后拖动右边栏可能不跟手（text_editor 重渲染开销）
-2. **大文件滚动**: 100KB 截断仍可能卡顿，需要虚拟滚动优化
-3. **语法高亮**: 需要新需求 `add-syntax-highlighting` 实现
+1. **~~拖拉性能~~**: 已解决 - 使用不折行模式（`WrapMethod::None`）
+2. **~~大文件滚动~~**: 已缓解 - 不折行模式下滚动流畅
+3. **语法高亮**: 已创建需求 `add-syntax-highlighting`（使用 autumnus）

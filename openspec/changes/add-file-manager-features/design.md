@@ -125,9 +125,11 @@ Cmd+Left/Right → app.rs 键盘事件 → active_tab signal 更新 → workspac
 - 全局快捷键可能与系统/应用快捷键冲突 → 使用 Cmd+Arrow 较安全
 
 ## Known Limitations (Deferred to Future)
-1. **拖拉右边栏性能问题**: text_editor 组件在布局变化时重新渲染，多标签时拖动不跟手
-2. **大文件滚动卡顿**: 100KB 截断仍可能包含数千行，需要虚拟滚动优化
-3. **语法高亮**: 明确为 Non-Goals，需要新需求 `add-syntax-highlighting`
+1. **~~拖拉右边栏性能问题~~**: 已解决 - 使用 `WrapMethod::None` 禁用折行后流畅
+2. **~~大文件滚动卡顿~~**: 已缓解 - 不折行模式下 100KB 内容滚动流畅
+3. **语法高亮**: 明确为 Non-Goals，已创建需求 `add-syntax-highlighting`（使用 autumnus）
+
+**技术说明**：折行模式下每次布局变化需要重新计算所有行的断行点，导致性能问题。禁用折行后，floem editor 内置的虚拟滚动（ScreenLines）可高效处理大文件。
 
 ## Open Questions
 - 无（拖拽改为右键菜单后，无技术风险）
