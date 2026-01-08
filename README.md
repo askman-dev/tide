@@ -40,7 +40,9 @@ cargo build --release
 ./build.sh
 ```
 
-**Code Signing**: The build script attempts to sign the app with the certificate name in `build.sh` (currently `mac 开发根证书`). Signing is best-effort and failures are ignored (`|| true`).
+**Code Signing**: The build script attempts to sign the app with a certificate named `"Mac Developer Certificate"`. You can either:
+- Install a development certificate with this exact name in your keychain, or
+- Ignore signing errors (the script continues on failure with `|| true`)
 
 ## Debugging
 
