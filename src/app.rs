@@ -14,10 +14,17 @@ use floem::event::{Event, EventListener, EventPropagation};
 use floem::ext_event::{register_ext_trigger, ExtSendTrigger};
 use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
-use floem::reactive::create_effect;
+use floem::reactive::{Scope, create_effect, with_scope};
 use floem::style::CursorStyle;
-use floem::views::editor::text::WrapMethod;
+use floem::text::FamilyOwned;
+use floem::views::editor::WrapProp;
+use floem::views::editor::keypress::default_key_handler;
+use floem::views::editor::text::{SimpleStyling, WrapMethod};
+use floem::views::editor::text_document::TextDocument;
+use floem::views::editor::view::editor_container_view;
+use floem::views::editor::Editor;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -662,6 +669,42 @@ fn menu_item_view(label_text: &str, theme: UiTheme) -> impl IntoView {
     })
 }
 
+fn read_only_code_viewer(content: String, theme: UiTheme) -> impl IntoView {
+    // `floem::views::text_editor::text_editor` hard-codes `is_active = |_| true`, which means it
+    // continuously calls `set_ime_cursor_area` even when it isn't focused. That breaks terminal
+    // IME: the OS preedit UI appears anchored to the editor instead of the focused terminal.
+    //
+    // Build a minimal editor container with an `is_active` gate tied to focus.
+    let scope = Scope::current().create_child();
+
+    let mut style_builder = SimpleStyling::builder();
+    style_builder
+        .font_size(12)
+        .line_height(1.25)
+        .font_family(
+            FamilyOwned::parse_list("Menlo, Monaco, 'Courier New', monospace").collect(),
+        );
+    let styling = Rc::new(style_builder.build());
+
+    let doc = Rc::new(TextDocument::new(scope, content));
+    let editor = Editor::new(scope, doc, styling, false);
+    editor.read_only.set(true);
+    let editor_sig = scope.create_rw_signal(editor);
+
+    with_scope(scope, move || {
+        // Keep this view non-active: it must not drive global IME state or cursor area, since it's
+        // a read-only viewer and the terminal should own IME when focused.
+        editor_container_view(editor_sig, |_| false, default_key_handler(editor_sig))
+    })
+    .style(move |s| {
+        s.flex_grow(1.0)
+            .size_full()
+            .background(theme.surface)
+            .color(theme.text)
+            .set(WrapProp, WrapMethod::None)
+    })
+}
+
 fn editor_workspace_view(
     editor_tabs: RwSignal<Vec<crate::model::EditorTab>>,
     active_tab_id: RwSignal<Option<usize>>,
@@ -722,18 +765,7 @@ fn editor_workspace_view(
             if let Some(id) = id_opt {
                 if let Some(tab) = tabs.iter().find(|t| t.id == id) {
                     let content = tab.content.clone();
-                    // Use text_editor for code viewing
-                    return text_editor(content)
-                        .editor_style(move |s| s.wrap_method(WrapMethod::None))
-                        .style(move |s| {
-                            s.flex_grow(1.0)
-                                .size_full()
-                                .background(theme.surface)
-                                .color(theme.text)
-                                .font_family("Menlo, Monaco, 'Courier New', monospace".to_string())
-                                .font_size(12.0)
-                        })
-                        .into_any();
+                    return read_only_code_viewer(content, theme).into_any();
                 }
             }
             

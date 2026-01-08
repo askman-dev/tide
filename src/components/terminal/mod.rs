@@ -290,6 +290,9 @@ fn terminal_pane_view(
     let pane_should_focus = pane.should_focus;
     let pane_title_buffer = pane.title_buffer.clone();
 
+    // Signal to store the ID of the focusable wrapper view
+    let focus_handle: RwSignal<Option<floem::ViewId>> = RwSignal::new(None);
+
     // Bundle all instance state signals
     let state = TerminalInstanceState::new();
 
@@ -705,7 +708,11 @@ fn terminal_pane_view(
     // Effect to handle programmatic focus request
     create_effect(move |_| {
         if pane_should_focus.get() {
-            canvas_id.request_focus();
+            if let Some(id) = focus_handle.get_untracked() {
+                id.request_focus();
+            } else {
+                canvas_id.request_focus();
+            }
             pane_should_focus.set(false);
         }
     });
@@ -713,15 +720,14 @@ fn terminal_pane_view(
     // Track if we're in selection mode (primary button held)
     let is_selecting = RwSignal::new(false);
 
-    // Wrap canvas to track window_origin
+    // Track this view's origin in window coordinates; required for correct IME caret anchoring.
+    let window_origin = RwSignal::new(floem::kurbo::Point::ZERO);
+
     let terminal_wrapper = terminal_canvas
-        .on_event_cont(EventListener::WindowGotFocus, move |_| {
-            // Dummy event to trigger update and capture window_origin
+        .on_move(move |pos| {
+            window_origin.set(pos);
         })
         .style(|s| s.width_full().height_full());
-
-    // Custom update to track window_origin
-    let terminal_wrapper_id = terminal_wrapper.id();
     
     // Effect to trigger repaint when session/error state or focus changes
     create_effect(move |_| {
@@ -741,16 +747,17 @@ fn terminal_pane_view(
         term_update_trigger.track();
         ime_focused.track();
         ime_update_tick.track();
+        window_origin.track();
         
         let (cell_width, cell_height) = cell_size.get_untracked();
-        let canvas_rect = terminal_wrapper_id.layout_rect();
+        let origin = window_origin.get_untracked();
         
         if !ime_focused.get_untracked() {
             last_ime_cursor_area.set(None);
             return;
         }
 
-        if cell_width <= 0.0 || cell_height <= 0.0 || canvas_rect.width() <= 0.0 {
+        if cell_width <= 0.0 || cell_height <= 0.0 {
             return;
         }
 
@@ -768,11 +775,11 @@ fn terminal_pane_view(
             let col = viewport_cursor.column.0 as f64;
             let row = viewport_cursor.line as f64;
 
-            // `canvas_rect` is window-relative; anchor the IME at the caret cell rect.
-            let x = canvas_rect.x0 + col * cell_width;
-            let y = canvas_rect.y0 + row * cell_height;
+            // Anchor the IME at the caret cell rect (window coordinates).
+            let x = CELL_PADDING + col * cell_width;
+            let y = CELL_PADDING + row * cell_height;
             Some((
-                floem::kurbo::Point::new(x, y),
+                origin + (x, y),
                 floem::kurbo::Size::new(cell_width, cell_height),
             ))
         });
@@ -898,8 +905,15 @@ fn terminal_pane_view(
         }
     });
 
+    let terminal_wrapper = terminal_wrapper.keyboard_navigable();
+    
+    // Capture the ID of the navigable view for focus requests
+    let focus_target_id = terminal_wrapper.id();
+    create_effect(move |_| {
+        focus_handle.set(Some(focus_target_id));
+    });
+
     let terminal_wrapper = terminal_wrapper
-        .keyboard_navigable()
         .style(move |s| {
             s.width_full()
                 .height_full()
@@ -929,8 +943,9 @@ fn terminal_pane_view(
             }
             EventPropagation::Continue
         })
-        .on_event_cont(EventListener::ImePreedit, move |_| {
+        .on_event(EventListener::ImePreedit, move |_| {
             ime_update_tick.update(|tick| *tick = tick.wrapping_add(1));
+            EventPropagation::Stop
         })
         .on_event(EventListener::KeyDown, move |event| {
             logging::measure_ui_event("terminal keydown", || {
@@ -1203,7 +1218,11 @@ fn terminal_pane_view(
                     let pos = pointer_event.pos;
                     {
                         logging::breadcrumb("terminal pointer down".to_string());
-                        canvas_id.request_focus();
+                        if let Some(id) = focus_handle.get_untracked() {
+                            id.request_focus();
+                        } else {
+                            canvas_id.request_focus();
+                        }
                         is_selecting.set(true);
 
                         let x = pos.x;
