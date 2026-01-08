@@ -28,7 +28,7 @@ cp "resources/Info.plist" "${APP_BUNDLE}/Contents/"
 
 chmod +x "${APP_BUNDLE}/Contents/MacOS/${BIN_NAME}"
 
-SIGN_CERT="mac 开发根证书"
+SIGN_CERT="Mac Developer Certificate"
 
 echo "Signing with '${SIGN_CERT}'..."
 codesign --force --deep --sign "${SIGN_CERT}" "${APP_BUNDLE}" 2>/dev/null || true
