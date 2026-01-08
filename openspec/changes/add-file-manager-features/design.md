@@ -45,8 +45,8 @@ struct EditorTab {
     id: usize,
     path: PathBuf,
     name: String,
-    is_pinned: bool,  // false = 临时（斜体）, true = 固定
-    content: RwSignal<String>,
+    is_pinned: RwSignal<bool>,  // false = 临时（斜体）, true = 固定
+    content: String,
 }
 ```
 
@@ -123,6 +123,11 @@ Cmd+Left/Right → app.rs 键盘事件 → active_tab signal 更新 → workspac
 - 轮询 git status 可能有性能影响 → 仅在窗口聚焦时轮询
 - 大文件预览可能卡顿 → 截断处理
 - 全局快捷键可能与系统/应用快捷键冲突 → 使用 Cmd+Arrow 较安全
+
+## Known Limitations (Deferred to Future)
+1. **拖拉右边栏性能问题**: text_editor 组件在布局变化时重新渲染，多标签时拖动不跟手
+2. **大文件滚动卡顿**: 100KB 截断仍可能包含数千行，需要虚拟滚动优化
+3. **语法高亮**: 明确为 Non-Goals，需要新需求 `add-syntax-highlighting`
 
 ## Open Questions
 - 无（拖拽改为右键菜单后，无技术风险）

@@ -51,6 +51,21 @@
 - **WHEN** 标签页为固定状态
 - **THEN** 标题文字显示为正常样式
 
+### Requirement: Active Tab Highlighting
+系统 SHALL 清晰区分当前激活的标签页与非激活标签页。
+
+#### Scenario: 激活状态样式
+- **WHEN** 标签页处于激活（Active）状态
+- **THEN** 标签页顶部显示 2px 的强调色（Accent Color）边框
+- **AND** 标题文字显示为粗体（Bold）
+- **AND** 背景色显示为 Element Background
+
+#### Scenario: 非激活状态样式
+- **WHEN** 标签页处于非激活（Inactive）状态
+- **THEN** 顶部边框为透明
+- **AND** 标题文字为正常粗细（Normal Weight）
+- **AND** 背景色显示为 Panel Background
+
 ### Requirement: Code Viewer
 编辑器 SHALL 以代码查看器模式显示文件内容。
 
@@ -69,3 +84,10 @@
 - **WHEN** 编辑器渲染内容
 - **THEN** 使用等宽字体（SF Mono / Menlo / Monaco）
 - **AND** 字体大小适合代码阅读（12-13px）
+
+### Known Limitations
+以下功能延迟到后续版本：
+
+1. **拖拉性能**: 打开多个标签后拖动右边栏可能不跟手（text_editor 重渲染开销）
+2. **大文件滚动**: 100KB 截断仍可能卡顿，需要虚拟滚动优化
+3. **语法高亮**: 需要新需求 `add-syntax-highlighting` 实现
