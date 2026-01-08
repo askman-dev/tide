@@ -94,6 +94,65 @@ pub fn collapsible_panel_header(
     })
 }
 
+pub fn collapsible_panel_header_with_actions<A: IntoView + 'static>(
+    title: String,
+    icon_svg: &'static str,
+    expanded: RwSignal<bool>,
+    actions: A,
+    theme: UiTheme,
+) -> impl IntoView {
+    let header_text = spaced_uppercase(&title);
+    h_stack((
+        // Left side: chevron + icon + title
+        h_stack((
+            // Collapse/expand chevron
+            dyn_container(
+                move || expanded.get(),
+                move |is_expanded| {
+                    let chevron_svg = if is_expanded { COLLAPSE_CHEVRON } else { EXPAND_CHEVRON };
+                    svg(chevron_svg)
+                        .style(move |s| {
+                            s.width(10.0)
+                                .height(10.0)
+                                .color(theme.text_soft)
+                        })
+                        .into_any()
+                },
+            ),
+            icon_soft(icon_svg, theme),
+            label(move || header_text.clone()).style(move |s| {
+                s.font_size(HEADER_FONT_SIZE)
+                    .font_bold()
+                    .color(theme.text_muted)
+            }),
+        ))
+        .on_click_stop(move |_| {
+            expanded.update(|v| *v = !*v);
+        })
+        .style(move |s| {
+            s.flex_grow(1.0)
+                .height_full()
+                .items_center()
+                .col_gap(6.0)
+                .cursor(CursorStyle::Pointer)
+        }),
+        // Right side: actions
+        container(actions).style(move |s| {
+            s.padding_right(10.0)
+                .items_center()
+        }),
+    ))
+    .style(move |s| {
+        s.width_full()
+            .height(HEADER_HEIGHT)
+            .flex_shrink(0.0)
+            .items_center()
+            .background(theme.panel_bg)
+            .padding_left(10.0)
+            .hover(|s| s.background(theme.element_bg))
+    })
+}
+
 pub fn list_item<V: IntoView + 'static>(content: V, indent: f32, theme: UiTheme) -> impl IntoView {
     container(content)
         .on_event(EventListener::PointerDown, |_| EventPropagation::Stop)
@@ -207,10 +266,10 @@ pub fn tab_button_with_menu(
             let on_reveal = on_reveal_clone.clone();
             let on_close = on_close_clone.clone();
             Menu::new("")
-                .entry(MenuItem::new("打开文件夹").action(move || on_open()))
-                .entry(MenuItem::new("在 Finder 中定位").action(move || on_reveal()))
+                .entry(MenuItem::new("Open Folder").action(move || on_open()))
+                .entry(MenuItem::new("Reveal in Finder").action(move || on_reveal()))
                 .separator()
-                .entry(MenuItem::new("关闭").action(move || on_close()))
+                .entry(MenuItem::new("Close").action(move || on_close()))
         });
 
     h_stack((tab_text, dropdown_arrow))

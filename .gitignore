@@ -9,3 +9,13 @@ dist/
 build/
 .cache/
 *.log
+
+# AI tools local config
+.claude/
+.factory/
+.gemini/
+
+# Local development files
+memory/
+swap_memory/
+check_floem.rs

@@ -1,14 +1,21 @@
 use crate::components::{
-    app_shell, collapsible_panel_view, file_tree_view, git_status_view, main_layout, tab_bar,
-    tab_button, tab_button_with_menu, terminal_view, FILE, FOLDER, GIT,
+    app_shell, collapsible_panel_view, collapsible_panel_view_with_actions, file_tree_view,
+    git_status_view, icon, main_layout, tab_bar, tab_button, tab_button_with_menu, terminal_view,
+    FILE, FOLDER, GIT, REFRESH,
 };
+use crate::logging;
 use crate::model::{TerminalPane, WorkspaceTab};
-use crate::services::{build_tree_entries, git_status_entries, load_launchers, Launcher, AppState, save_state};
+use crate::services::{
+    build_tree_entries, git_status_entries, load_launchers, AppState, Launcher,
+    save_state,
+};
 use crate::theme::UiTheme;
+use floem::event::{Event, EventListener, EventPropagation};
 use floem::ext_event::{register_ext_trigger, ExtSendTrigger};
+use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
 use floem::reactive::create_effect;
-use crate::logging;
+use floem::style::CursorStyle;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -181,6 +188,36 @@ pub fn app_view(initial_state: AppState) -> impl IntoView {
         logging::log_line("INFO", &format!("log file: {}", path.display()));
     }
     app_shell(v_stack((tabs_bar, content)).style(|s| s.size_full()), theme)
+        .on_event(EventListener::KeyDown, move |event| {
+            if let Event::KeyDown(key_event) = event {
+                if key_event.modifiers.meta() {
+                    let mut current_tabs = tabs.get_untracked();
+                    if current_tabs.is_empty() { return EventPropagation::Continue; }
+                    
+                    let active_id = active_tab.get_untracked();
+                    let current_idx = current_tabs.iter().position(|t| t.id == active_id).unwrap_or(0);
+                    
+                    match key_event.key.logical_key {
+                        Key::Named(NamedKey::ArrowLeft) => {
+                            let next_idx = if current_idx == 0 {
+                                current_tabs.len() - 1
+                            } else {
+                                current_idx - 1
+                            };
+                            active_tab.set(current_tabs[next_idx].id);
+                            return EventPropagation::Stop;
+                        }
+                        Key::Named(NamedKey::ArrowRight) => {
+                            let next_idx = (current_idx + 1) % current_tabs.len();
+                            active_tab.set(current_tabs[next_idx].id);
+                            return EventPropagation::Stop;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            EventPropagation::Continue
+        })
 }
 
 fn install_ui_watchdog() {
@@ -216,28 +253,166 @@ fn workspace_view(
     let workspace_root = tab.root;
     let file_tree_entries = tab.file_tree;
     let git_status_entries_signal = tab.git_status;
+    let git_status_buffer = tab.git_status_buffer.clone();
+    let editor_tabs = tab.editor_tabs;
+    let active_editor_tab_id = tab.active_editor_tab;
+    let terminal_panes = tab.terminal_panes;
+    let focused_pane_id = tab.focused_pane_id;
+
+    // Start polling for git status updates
+    let git_status_trigger = ExtSendTrigger::new();
+    let workspace_root_val = workspace_root.get_untracked();
+    let git_status_trigger_clone = git_status_trigger;
+    let git_status_buffer_clone = git_status_buffer.clone();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(5));
+        let entries = git_status_entries(&workspace_root_val);
+        if let Ok(mut guard) = git_status_buffer_clone.lock() {
+            *guard = Some(entries);
+        }
+        register_ext_trigger(git_status_trigger_clone);
+    });
+
+    create_effect(move |_| {
+        git_status_trigger.track();
+        if let Ok(mut guard) = git_status_buffer.lock() {
+            if let Some(entries) = guard.take() {
+                git_status_entries_signal.set(entries);
+            }
+        }
+    });
+
 
     // Collapse state signals - all expanded by default
     let files_expanded = RwSignal::new(true);
     let changes_expanded = RwSignal::new(true);
     let history_expanded = RwSignal::new(true);
 
+    let refresh_changes = move || {
+        let root = workspace_root.get_untracked();
+        let entries = git_status_entries(&root);
+        git_status_entries_signal.set(entries);
+        logging::breadcrumb("manual git status refresh");
+    };
+
+    let on_file_click = move |path: PathBuf, is_double_click: bool| {
+        logging::breadcrumb(format!("file clicked: {} dbl={}", path.display(), is_double_click));
+        
+        // 1. Check if already open
+        let mut tabs = editor_tabs.get_untracked();
+        if let Some(existing_idx) = tabs.iter().position(|t| t.path == path) {
+            let id = tabs[existing_idx].id;
+            if is_double_click {
+                tabs[existing_idx].is_pinned.set(true);
+            }
+            active_editor_tab_id.set(Some(id));
+            return;
+        }
+
+        // 2. Read file content
+        match crate::services::read_file_preview(&path) {
+            Ok(content) => {
+                let name = path.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                
+                let new_id = tab.next_editor_tab_id.get_untracked();
+                tab.next_editor_tab_id.set(new_id + 1);
+
+                let new_tab = crate::model::EditorTab {
+                    id: new_id,
+                    path,
+                    name,
+                    is_pinned: RwSignal::new(is_double_click),
+                    content,
+                };
+
+                // 3. Find temporary tab to replace (only if single click and not forcing pin)
+                if !is_double_click {
+                    if let Some(temp_idx) = tabs.iter().position(|t| !t.is_pinned.get_untracked()) {
+                        // Replace temp tab
+                        tabs[temp_idx] = new_tab;
+                        editor_tabs.set(tabs);
+                        active_editor_tab_id.set(Some(new_id));
+                        return;
+                    }
+                }
+                
+                // Otherwise append (pinned or no temp tab found)
+                tabs.push(new_tab);
+                editor_tabs.set(tabs);
+                active_editor_tab_id.set(Some(new_id));
+            }
+            Err(e) => {
+                logging::log_line("ERROR", &format!("Failed to read file {}: {}", path.display(), e));
+            }
+        }
+    };
+
+    let on_send_to_terminal = move |path: PathBuf| {
+        let path_str = path.to_string_lossy();
+        let quoted = if path_str.contains(' ') {
+            format!("'{}'", path_str)
+        } else {
+            path_str.to_string()
+        };
+        
+        let pane_id_opt = focused_pane_id.get_untracked();
+        let panes = terminal_panes.get_untracked();
+        let target_pane = if let Some(id) = pane_id_opt {
+            panes.iter().find(|p| p.id == id).cloned()
+        } else {
+            panes.first().cloned()
+        };
+        
+        if let Some(pane) = target_pane {
+            pane.should_focus.set(true);
+            if let Some(session) = pane.session.get_untracked() {
+                let _ = session.write(quoted.as_bytes());
+            }
+        }
+    };
+
+    let on_copy_path = move |path: PathBuf| {
+        crate::services::set_clipboard_string(&path.to_string_lossy());
+    };
+
     let project_header = project_header_view(workspace_name, workspace_root, theme)
         .style(|s| s.flex_shrink(0.0)); // Fixed height, don't shrink
     let files_panel = collapsible_panel_view(
         "File explorer",
         FOLDER,
-        file_tree_view_reactive(file_tree_entries, theme)
-            .style(|s| s.width_full()),
+        file_tree_view_reactive(
+            file_tree_entries,
+            on_file_click,
+            on_send_to_terminal.clone(),
+            on_copy_path.clone(),
+            theme,
+        )
+        .style(|s| s.width_full()),
         files_expanded,
         theme,
     );
-    let changes_panel = collapsible_panel_view(
+    let changes_panel = collapsible_panel_view_with_actions(
         "Changes",
         GIT,
-        git_status_view_reactive(git_status_entries_signal, theme)
-            .style(|s| s.width_full()),
+        git_status_view_reactive(
+            git_status_entries_signal,
+            on_send_to_terminal.clone(),
+            on_copy_path.clone(),
+            workspace_root.get_untracked(),
+            theme,
+        )
+        .style(|s| s.width_full()),
         changes_expanded,
+        container(icon(REFRESH, theme))
+            .on_click_stop(move |_| refresh_changes())
+            .style(move |s| {
+                s.padding(4.0)
+                    .border_radius(4.0)
+                    .hover(|s| s.background(theme.surface))
+                    .cursor(floem::style::CursorStyle::Pointer)
+            }),
         theme,
     );
     let history_panel = collapsible_panel_view(
@@ -270,7 +445,7 @@ fn workspace_view(
     });
 
     let center_column = terminal_view(theme, tab, launchers);
-    let right_column = editor_workspace_view(theme);
+    let right_column = editor_workspace_view(editor_tabs, active_editor_tab_id, theme);
 
     main_layout(left_column, center_column, right_column, theme)
 }
@@ -298,25 +473,57 @@ fn project_header_view(
     })
 }
 
-/// Reactive file tree view - rebuilds when signal changes
-fn file_tree_view_reactive(
+fn file_tree_view_reactive<F, S, C>(
     entries: RwSignal<Vec<crate::model::TreeEntry>>,
+    on_file_click: F,
+    on_send_to_terminal: S,
+    on_copy_path: C,
     theme: UiTheme,
-) -> impl IntoView {
+) -> impl IntoView
+where
+    F: Fn(PathBuf, bool) + Clone + 'static,
+    S: Fn(PathBuf) + Clone + 'static,
+    C: Fn(PathBuf) + Clone + 'static,
+{
     dyn_container(
         move || entries.get(),
-        move |entries_vec| file_tree_view(entries_vec, theme).into_any(),
+        move |entries_vec| {
+            file_tree_view(
+                entries_vec,
+                theme,
+                on_file_click.clone(),
+                on_send_to_terminal.clone(),
+                on_copy_path.clone(),
+            )
+            .into_any()
+        },
     )
 }
 
 /// Reactive git status view - rebuilds when signal changes
-fn git_status_view_reactive(
+fn git_status_view_reactive<S, C>(
     entries: RwSignal<Vec<String>>,
+    on_send_to_terminal: S,
+    on_copy_path: C,
+    workspace_root: PathBuf,
     theme: UiTheme,
-) -> impl IntoView {
+) -> impl IntoView
+where
+    S: Fn(PathBuf) + Clone + 'static,
+    C: Fn(PathBuf) + Clone + 'static,
+{
     dyn_container(
         move || entries.get(),
-        move |entries_vec| git_status_view(entries_vec, theme).into_any(),
+        move |entries_vec| {
+            git_status_view(
+                entries_vec,
+                theme,
+                on_send_to_terminal.clone(),
+                on_copy_path.clone(),
+                workspace_root.clone(),
+            )
+            .into_any()
+        },
     )
 }
 
@@ -454,55 +661,170 @@ fn menu_item_view(label_text: &str, theme: UiTheme) -> impl IntoView {
     })
 }
 
-fn editor_workspace_view(theme: UiTheme) -> impl IntoView {
-    let tabs = h_stack((
-        editor_tab_view("index.ts", true, theme),
-        editor_tab_view("example.com", false, theme),
-        editor_tab_view("spec-checkpoint-requirement.md", false, theme),
-    ))
+fn editor_workspace_view(
+    editor_tabs: RwSignal<Vec<crate::model::EditorTab>>,
+    active_tab_id: RwSignal<Option<usize>>,
+    theme: UiTheme,
+) -> impl IntoView {
+    let tabs = dyn_stack(
+        move || editor_tabs.get(),
+        |tab| tab.id,
+        move |tab| {
+            let id = tab.id;
+            // Create a reactive closure for active state
+            let is_active = move || active_tab_id.get() == Some(id);
+            let editor_tabs = editor_tabs;
+            let active_tab_id = active_tab_id;
+            let is_pinned_signal = tab.is_pinned;
+            
+            editor_tab_view(
+                tab.clone(),
+                is_active,
+                move || {
+                    active_tab_id.set(Some(id));
+                },
+                move || {
+                    // Close tab
+                    let mut tabs = editor_tabs.get_untracked();
+                    if let Some(idx) = tabs.iter().position(|t| t.id == id) {
+                        tabs.remove(idx);
+                        let next_active = if tabs.is_empty() {
+                            None
+                        } else {
+                            Some(tabs[idx.min(tabs.len() - 1)].id)
+                        };
+                        editor_tabs.set(tabs);
+                        active_tab_id.set(next_active);
+                    }
+                },
+                move || {
+                    // Pin tab on double click
+                    is_pinned_signal.set(true);
+                },
+                theme,
+            )
+        },
+    )
     .style(move |s| {
         s.height(30.0)
             .items_center()
             .padding_horiz(8.0)
-            .col_gap(6.0)
+            .col_gap(2.0)
             .border_bottom(1.0)
             .border_color(theme.border_subtle)
             .background(theme.panel_bg)
     });
 
-    let editor_body = container(label(||
-        "Editor placeholder (code, web previews, or docs appear here)."
-    ))
-    .style(move |s| {
-        s.flex_grow(1.0)
-            .padding(16.0)
-            .background(theme.surface)
-            .color(theme.text_soft)
-            .font_family("SF Mono, Menlo, Monaco".to_string())
-            .font_size(12.0)
-    });
+    let editor_body = dyn_container(
+        move || (active_tab_id.get(), editor_tabs.get()),
+        move |(id_opt, tabs)| {
+            if let Some(id) = id_opt {
+                if let Some(tab) = tabs.iter().find(|t| t.id == id) {
+                    let content = tab.content.clone();
+                    // Use text_editor for code viewing
+                    return text_editor(content)
+                        .style(move |s| {
+                            s.flex_grow(1.0)
+                                .size_full()
+                                .background(theme.surface)
+                                .color(theme.text)
+                                .font_family("Menlo, Monaco, 'Courier New', monospace".to_string())
+                                .font_size(12.0)
+                        })
+                        .into_any();
+                }
+            }
+            
+            // Empty state
+            container(label(|| "No file open"))
+                .style(move |s| {
+                    s.flex_grow(1.0)
+                        .size_full()
+                        .items_center()
+                        .justify_center()
+                        .background(theme.surface)
+                        .color(theme.text_soft)
+                })
+                .into_any()
+        },
+    )
+    .style(|s| s.flex_grow(1.0).size_full());
 
     v_stack((tabs, editor_body)).style(|s| s.size_full())
 }
 
-fn editor_tab_view(label_text: &str, is_active: bool, theme: UiTheme) -> impl IntoView {
-    let label_text = label_text.to_string();
-    let background = if is_active {
+fn editor_tab_view<F>(
+    tab: crate::model::EditorTab,
+    is_active: F,
+    on_click: impl Fn() + 'static,
+    on_close: impl Fn() + 'static,
+    on_double_click: impl Fn() + 'static,
+    theme: UiTheme,
+) -> impl IntoView 
+where F: Fn() -> bool + 'static + Clone
+{
+    let is_active_bg = is_active.clone();
+    let background = move || if is_active_bg() {
         theme.element_bg
     } else {
         theme.panel_bg
     };
-    container(label(move || label_text.clone()).style(move |s| {
-        s.font_size(12.0)
-            .color(if is_active { theme.text } else { theme.text_muted })
-            .text_ellipsis()
-    }))
+    
+    let is_active_border = is_active.clone();
+    let border_color = move || if is_active_border() {
+        theme.accent
+    } else {
+        floem::peniko::Color::TRANSPARENT
+    };
+    
+    let is_pinned = tab.is_pinned;
+    let font_style = move || if is_pinned.get() {
+        floem::text::Style::Normal
+    } else {
+        floem::text::Style::Italic
+    };
+    
+    let is_active_font = is_active.clone();
+    let font_weight = move || if is_active_font() {
+        floem::text::Weight::BOLD
+    } else {
+        floem::text::Weight::NORMAL
+    };
+
+    let is_active_text = is_active.clone();
+    h_stack((
+        label(move || tab.name.clone()).style(move |s| {
+            s.font_size(12.0)
+                .font_style(font_style())
+                .font_weight(font_weight())
+                .color(if is_active_text() { theme.text } else { theme.text_muted })
+                .text_ellipsis()
+        }),
+        // Close button
+        label(|| "×")
+            .on_click_stop(move |_| on_close())
+            .style(move |s| {
+                s.margin_left(6.0)
+                    .font_size(14.0)
+                    .color(theme.text_soft)
+                    .hover(|s| s.color(theme.text))
+                    .cursor(CursorStyle::Pointer)
+            }),
+    ))
+    .on_click_stop(move |_| on_click())
+    .on_event(EventListener::DoubleClick, move |_| {
+        on_double_click();
+        EventPropagation::Stop
+    })
     .style(move |s| {
-        s.height(22.0)
-            .padding_horiz(10.0)
+        s.height(26.0)
+            .padding_horiz(8.0)
             .items_center()
-            .border_radius(6.0)
-            .background(background)
+            .border_top(2.0)
+            .border_color(border_color())
+            .background(background())
+            .cursor(CursorStyle::Pointer)
+            .hover(|s| s.background(theme.element_bg))
     })
 }
 
@@ -529,10 +851,15 @@ fn build_tab(id: usize, root: PathBuf) -> WorkspaceTab {
     WorkspaceTab {
         id,
         name: RwSignal::new(name),
-        root: RwSignal::new(root),
-        file_tree: RwSignal::new(file_tree),
-        git_status: RwSignal::new(git_status),
+        root: RwSignal::new(root.clone()),
+        file_tree: RwSignal::new(build_tree_entries(&root, 0)),
+        git_status: RwSignal::new(git_status_entries(&root)),
+        git_status_buffer: Arc::new(Mutex::new(None)),
+        editor_tabs: RwSignal::new(Vec::new()),
+        active_editor_tab: RwSignal::new(None),
+        focused_pane_id: RwSignal::new(None),
         terminal_panes: RwSignal::new(vec![initial_pane]),
         next_pane_id: RwSignal::new(1),
+        next_editor_tab_id: RwSignal::new(0),
     }
 }

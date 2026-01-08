@@ -53,3 +53,24 @@ pub fn list_dir_entries(root: &Path, depth: usize) -> Vec<TreeEntry> {
 
     entries
 }
+
+pub fn read_file_preview(path: &std::path::Path) -> std::io::Result<String> {
+    let metadata = fs::metadata(path)?;
+    let size = metadata.len();
+
+    // Max size 1MB for preview, read first 100KB if larger
+    const MAX_PREVIEW_SIZE: u64 = 1024 * 1024; // 1MB
+    const TRUNCATE_SIZE: usize = 100 * 1024; // 100KB
+
+    if size > MAX_PREVIEW_SIZE {
+        use std::io::Read;
+        let mut file = fs::File::open(path)?;
+        let mut buffer = vec![0; TRUNCATE_SIZE];
+        let n = file.read(&mut buffer)?;
+        let mut content = String::from_utf8_lossy(&buffer[..n]).to_string();
+        content.push_str("\n\n... (file truncated, too large to preview)");
+        Ok(content)
+    } else {
+        fs::read_to_string(path)
+    }
+}

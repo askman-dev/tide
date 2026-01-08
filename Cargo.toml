@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 dirs = "6.0.0"
-floem = { git = "https://github.com/lapce/floem", rev = "e0dd862564e3afbad5cba8ebe60df166a7a41e56" }
+floem = { git = "https://github.com/lapce/floem", rev = "e0dd862564e3afbad5cba8ebe60df166a7a41e56", features = ["editor"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 

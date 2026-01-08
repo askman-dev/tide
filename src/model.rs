@@ -27,10 +27,28 @@ pub struct WorkspaceTab {
     pub root: RwSignal<PathBuf>,
     pub file_tree: RwSignal<Vec<TreeEntry>>,
     pub git_status: RwSignal<Vec<String>>,
+    /// Buffer for cross-thread git status updates
+    pub git_status_buffer: Arc<Mutex<Option<Vec<String>>>>,
+    /// Editor tabs for this workspace
+    pub editor_tabs: RwSignal<Vec<EditorTab>>,
+    pub active_editor_tab: RwSignal<Option<usize>>,
+    /// Focused terminal pane ID
+    pub focused_pane_id: RwSignal<Option<usize>>,
     /// Terminal panes (supports splits - multiple panes side by side)
     pub terminal_panes: RwSignal<Vec<TerminalPane>>,
     /// ID counter for creating new panes
     pub next_pane_id: RwSignal<usize>,
+    /// ID counter for creating new editor tabs
+    pub next_editor_tab_id: RwSignal<usize>,
+}
+
+#[derive(Clone)]
+pub struct EditorTab {
+    pub id: usize,
+    pub path: PathBuf,
+    pub name: String,
+    pub is_pinned: RwSignal<bool>,
+    pub content: String,
 }
 
 #[derive(Clone)]

@@ -7,7 +7,7 @@ pub mod state;
 pub mod launcher;
 
 pub use clipboard::{get_clipboard_string, set_clipboard_string};
-pub use fs::{build_tree_entries, list_dir_entries};
+pub use fs::{build_tree_entries, list_dir_entries, read_file_preview};
 pub use git::git_status_entries;
 pub use terminal::TerminalSession;
 pub use state::{load_state, save_state, AppState};

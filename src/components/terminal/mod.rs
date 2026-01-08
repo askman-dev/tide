@@ -114,9 +114,7 @@ pub fn terminal_view(theme: UiTheme, workspace: WorkspaceTab, launchers: RwSigna
     let workspace_root = workspace.root;
     let terminal_panes = workspace.terminal_panes;
     let next_pane_id = workspace.next_pane_id;
-
-    // Track which pane is focused (for cursor visibility)
-    let focused_pane_id: RwSignal<Option<usize>> = RwSignal::new(None);
+    let focused_pane_id = workspace.focused_pane_id;
 
     // Track splitter drag state at parent level (not inside dyn_stack)
     // This prevents pane views from being rebuilt when drag state changes
@@ -1356,7 +1354,7 @@ fn terminal_pane_view(
             // Only show Copy if there's a selection
             if has_selection {
                 let session_for_copy = session.get_untracked();
-                menu = menu.entry(MenuItem::new("复制").action(move || {
+                menu = menu.entry(MenuItem::new("Copy").action(move || {
                     if let Some(ref sess) = session_for_copy {
                         if let Some(text) = sess.with_term(|term| term.selection_to_string()) {
                             crate::services::set_clipboard_string(&text);
@@ -1366,7 +1364,7 @@ fn terminal_pane_view(
                 }));
             }
 
-            menu = menu.entry(MenuItem::new("粘贴").action(move || {
+            menu = menu.entry(MenuItem::new("Paste").action(move || {
                 if let Some(sess) = session.get_untracked() {
                     if let Some(text) = crate::services::get_clipboard_string() {
                         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
@@ -1382,7 +1380,7 @@ fn terminal_pane_view(
             // Split actions
             menu = menu
                 .separator()
-                .entry(MenuItem::new("向右分割").action(move || {
+                .entry(MenuItem::new("Split Right").action(move || {
                     logging::log_line("INFO", &format!("Terminal: Split right from pane {pane_id}"));
                     let new_id = next_pane_id.get();
                     next_pane_id.set(new_id + 1);
@@ -1429,7 +1427,7 @@ fn terminal_pane_view(
                         }
                     });
                 }))
-                .entry(MenuItem::new("向左分割").action(move || {
+                .entry(MenuItem::new("Split Left").action(move || {
                     logging::log_line("INFO", &format!("Terminal: Split left from pane {pane_id}"));
                     let new_id = next_pane_id.get();
                     next_pane_id.set(new_id + 1);
@@ -1479,7 +1477,7 @@ fn terminal_pane_view(
 
             menu = menu
                 .separator()
-                .entry(MenuItem::new("重置终端").action(move || {
+                .entry(MenuItem::new("Reset Terminal").action(move || {
                     logging::log_line("INFO", "Terminal: Reset requested");
                     session_for_reset.set(None);
                     error_msg_for_reset.set(None);
@@ -1538,6 +1536,32 @@ fn control_center_header(
             .color(theme.text_muted)
             .margin_right(12.0)
     });
+
+    let config_button = {
+        container(label(|| "Settings").style(move |s| {
+            s.font_size(11.0).color(theme.text_soft)
+        }))
+        .style(move |s| {
+            s.padding_horiz(8.0)
+                .padding_vert(4.0)
+                .border(1.0)
+                .border_color(theme.border_subtle)
+                .border_radius(4.0)
+                .background(theme.element_bg)
+                .hover(|s| s.background(theme.accent.with_alpha(0.2)))
+                .cursor(floem::style::CursorStyle::Pointer)
+        })
+        .on_click_stop(move |_| {
+            let path = crate::services::config::launchers_file_path();
+            if !path.exists() {
+                let _ = std::fs::write(&path, "[]");
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let _ = std::process::Command::new("open").arg("-R").arg(path).spawn();
+            }
+        })
+    };
 
     // Launcher buttons
     let launchers_list = dyn_stack(
@@ -1671,8 +1695,8 @@ fn control_center_header(
         }
     ).style(|s| s.flex_row().col_gap(8.0).items_center().min_width(0.0));
 
-    h_stack((label_view, launchers_list))
-        .style(|s| s.width_full().items_center().height(28.0).padding_horiz(8.0).min_width(0.0))
+    h_stack((label_view, launchers_list, config_button))
+        .style(|s| s.width_full().items_center().height(28.0).padding_horiz(8.0).min_width(0.0).col_gap(8.0))
 }
 
 
